@@ -377,3 +377,115 @@ def test_gcm_fallback_logs_warning_when_no_token(tmp_path, monkeypatch, caplog):
         "Falling back to local Git Credential Manager (GCM)" in rec.message
         for rec in caplog.records
     )
+
+
+def test_self_hosted_reporescue_mode_succeeds(tmp_path):
+    """Verifies Mode A: RepoRescue safely operates on its own codebase via isolated task branch."""
+    repo = tmp_path / "RepoRescue"
+    repo.mkdir()
+    run_command(["git", "init"], cwd=repo)
+    run_command(["git", "config", "user.name", "RepoRescue Bot"], cwd=repo)
+    run_command(["git", "config", "user.email", "bot@reporescue.dev"], cwd=repo)
+    run_command(
+        [
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/JishnuKarthikKonne/RepoRescue.git",
+        ],
+        cwd=repo,
+    )
+
+    core_file = repo / "core.py"
+    core_file.write_text("def run(): return False\n", encoding="utf-8")
+    run_command(["git", "add", "."], cwd=repo)
+    run_command(["git", "commit", "-m", "initial commit"], cwd=repo)
+
+    wt_path = repo / ".reporescue" / "worktrees" / "reporescue-task-self01"
+    wt_path.parent.mkdir(parents=True)
+    branch = "reporescue/task-self01"
+    run_command(
+        ["git", "worktree", "add", "-b", branch, str(wt_path), "HEAD"], cwd=repo
+    )
+
+    core_wt = wt_path / "core.py"
+    core_wt.write_text("def run(): return True\n", encoding="utf-8")
+    run_command(["git", "add", "."], cwd=wt_path)
+    run_command(["git", "commit", "-m", "fix: core run returns True"], cwd=wt_path)
+
+    fp, _, _ = compute_worktree_patch_fingerprint(wt_path)
+    task = _create_approved_task("task-self01", branch, fp)
+
+    # In self-hosted mode: repository is RepoRescue itself, is_demo is False
+    cfg = GitHubConfig(
+        repository="JishnuKarthikKonne/RepoRescue",
+        orchestrator_repository="JishnuKarthikKonne/RepoRescue",
+        token="ghp_test_token_selfhosted",
+        dry_run=True,
+        is_demo=False,
+    )
+    mock_client = MockGitHubClient(cfg)
+    mgr = GitHubPRManager(config=cfg, client=mock_client)
+
+    result = mgr.publish_draft_pr(task, wt_path)
+    assert result.pr_number == 1
+    assert result.draft is True
+    assert task.status == TaskStatus.PR_CREATED
+    assert "https://github.com/JishnuKarthikKonne/RepoRescue/pull/1" in result.html_url
+
+
+def test_external_customer_repo_mode_succeeds(tmp_path):
+    """Verifies Mode B: RepoRescue safely operates on an external customer repository."""
+    cust_repo = tmp_path / "customer-service"
+    cust_repo.mkdir()
+    run_command(["git", "init"], cwd=cust_repo)
+    run_command(["git", "config", "user.name", "Customer Dev"], cwd=cust_repo)
+    run_command(["git", "config", "user.email", "dev@customer.com"], cwd=cust_repo)
+    run_command(
+        [
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme-corp/customer-service.git",
+        ],
+        cwd=cust_repo,
+    )
+
+    api_file = cust_repo / "api.py"
+    api_file.write_text("def handler(): return 500\n", encoding="utf-8")
+    run_command(["git", "add", "."], cwd=cust_repo)
+    run_command(["git", "commit", "-m", "init customer service"], cwd=cust_repo)
+
+    wt_path = cust_repo / ".reporescue" / "worktrees" / "reporescue-task-cust01"
+    wt_path.parent.mkdir(parents=True)
+    branch = "reporescue/task-cust01"
+    run_command(
+        ["git", "worktree", "add", "-b", branch, str(wt_path), "HEAD"], cwd=cust_repo
+    )
+
+    api_wt = wt_path / "api.py"
+    api_wt.write_text("def handler(): return 200\n", encoding="utf-8")
+    run_command(["git", "add", "."], cwd=wt_path)
+    run_command(["git", "commit", "-m", "fix: return 200"], cwd=wt_path)
+
+    fp, _, _ = compute_worktree_patch_fingerprint(wt_path)
+    task = _create_approved_task("task-cust01", branch, fp)
+
+    # In customer mode: repository is customer repo, orchestrator repo is RepoRescue
+    cfg = GitHubConfig(
+        repository="acme-corp/customer-service",
+        orchestrator_repository="JishnuKarthikKonne/RepoRescue",
+        token="ghp_test_token_customer",
+        dry_run=True,
+        is_demo=False,
+    )
+    mock_client = MockGitHubClient(cfg)
+    mgr = GitHubPRManager(config=cfg, client=mock_client)
+
+    result = mgr.publish_draft_pr(task, wt_path)
+    assert result.pr_number == 1
+    assert result.draft is True
+    assert task.status == TaskStatus.PR_CREATED
+    assert "https://github.com/acme-corp/customer-service/pull/1" in result.html_url
