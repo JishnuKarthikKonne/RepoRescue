@@ -3,12 +3,32 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 logger = logging.getLogger("reporescue.agent_runtime")
+
+
+class AgentRuntimeError(Exception):
+    """Base exception for agent runtime errors."""
+
+
+class RuntimeConfigurationError(AgentRuntimeError):
+    """Raised when real AI runtime is requested but configuration or credentials are missing."""
+
+
+class AgentNetworkError(AgentRuntimeError):
+    """Raised when a network request to an AI provider fails or times out."""
+
+
+class AgentResponseValidationError(AgentRuntimeError):
+    """Raised when model returns non-conforming or invalid structured JSON."""
 
 
 @dataclass(frozen=True)
@@ -52,6 +72,167 @@ def load_agent_prompt(role: str, repo_root: Path | None = None) -> str:
     return f"You are the RepoRescue {role.capitalize()} Agent."
 
 
+# Schema specifications injected into system prompts for real AI providers
+ROLE_SCHEMA_INSTRUCTIONS: dict[str, str] = {
+    "triager": (
+        "Respond with a single JSON object containing:\n"
+        '{\n  "summary": "one-sentence restatement of the problem",\n'
+        '  "severity": "P0" | "P1" | "P2" | "P3",\n'
+        '  "affected_components": ["component1", ...],\n'
+        '  "acceptance_criteria": "what must pass to consider resolved",\n'
+        '  "missing_information": []\n}'
+    ),
+    "investigator": (
+        "Respond with a single JSON object containing:\n"
+        '{\n  "probable_root_cause": "detailed explanation of bug cause",\n'
+        '  "affected_files": ["relative/path/to/file.py", ...],\n'
+        '  "evidence": ["evidence line 1", ...],\n'
+        '  "reproduction_strategy": "proposed strategy to reproduce",\n'
+        '  "confidence": "low" | "medium" | "high"\n}'
+    ),
+    "reproducer": (
+        "Respond with a single JSON object containing:\n"
+        '{\n  "test_file": "tests/test_reproduce_<bug>.py",\n'
+        '  "test_code": "import pytest\\n\\ndef test_reproduce_...():\\n    ...",\n'
+        '  "failure_evidence": "description of expected failure output"\n}'
+    ),
+    "fixer": (
+        "Respond with a single JSON object containing:\n"
+        '{\n  "changed_files": ["relative/path/to/file.py", ...],\n'
+        '  "file_contents": {\n'
+        '    "relative/path/to/file.py": "full content of fixed file"\n'
+        "  },\n"
+        '  "rationale": "one-sentence rationale for the fix"\n}'
+    ),
+    "verifier": (
+        "Respond with a single JSON object containing:\n"
+        '{\n  "passed_count": 0,\n'
+        '  "failed_count": 0,\n'
+        '  "duration_seconds": 0.0,\n'
+        '  "exit_code": 0,\n'
+        '  "test_logs": "test runner output",\n'
+        '  "verified": true\n}'
+    ),
+}
+
+
+def extract_json_payload(raw_text: str) -> dict[str, Any]:
+    """Extracts and parses JSON object from model response text.
+
+    Supports:
+    - Pure JSON string
+    - Markdown code fences ```json ... ``` or ``` ... ```
+    - Substrings bounded by outer curly braces
+    """
+    text = raw_text.strip()
+    if not text:
+        raise AgentResponseValidationError("Empty response received from model.")
+
+    # 1. Direct JSON parse
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Markdown code block extraction
+    code_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if code_block_match:
+        try:
+            data = json.loads(code_block_match.group(1))
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Outer curly braces extraction
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        candidate = text[first_brace : last_brace + 1]
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    raise AgentResponseValidationError(
+        f"Failed to parse valid JSON object from model response: {text[:150]}..."
+    )
+
+
+def validate_agent_payload(role: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Validates structured JSON payload conforming to the role's schema."""
+    role = role.lower()
+    if role == "triager":
+        summary = data.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise AgentResponseValidationError(
+                "Triager output missing valid 'summary' string"
+            )
+        sev = str(data.get("severity", "P2")).upper()
+        if sev not in ("P0", "P1", "P2", "P3"):
+            sev = "P2"
+        data["severity"] = sev
+        comps = data.get("affected_components", ["core"])
+        if not isinstance(comps, list):
+            comps = [str(comps)]
+        data["affected_components"] = comps
+        if not isinstance(data.get("acceptance_criteria"), str):
+            data["acceptance_criteria"] = "Issue resolved and verified by test suite."
+
+    elif role == "investigator":
+        cause = data.get("probable_root_cause")
+        if not isinstance(cause, str) or not cause.strip():
+            raise AgentResponseValidationError(
+                "Investigator output missing valid 'probable_root_cause' string"
+            )
+        files = data.get("affected_files", [])
+        if not isinstance(files, list):
+            files = [str(files)]
+        data["affected_files"] = files
+        evidence = data.get("evidence", [])
+        if not isinstance(evidence, list):
+            evidence = [str(evidence)]
+        data["evidence"] = evidence
+        conf = str(data.get("confidence", "medium")).lower()
+        if conf not in ("low", "medium", "high"):
+            conf = "medium"
+        data["confidence"] = conf
+
+    elif role == "reproducer":
+        test_file = data.get("test_file")
+        if not isinstance(test_file, str) or not test_file.strip():
+            raise AgentResponseValidationError(
+                "Reproducer output missing valid 'test_file'"
+            )
+        test_code = data.get("test_code")
+        if not isinstance(test_code, str) or not test_code.strip():
+            raise AgentResponseValidationError(
+                "Reproducer output missing valid 'test_code'"
+            )
+
+    elif role == "fixer":
+        file_contents = data.get("file_contents")
+        if not isinstance(file_contents, dict) or not file_contents:
+            if not data.get("diff"):
+                raise AgentResponseValidationError(
+                    "Fixer output missing valid 'file_contents' dictionary or 'diff'"
+                )
+            file_contents = {}
+        data["file_contents"] = file_contents
+        changed_files = data.get("changed_files", list(file_contents.keys()))
+        if not isinstance(changed_files, list):
+            changed_files = list(file_contents.keys())
+        data["changed_files"] = changed_files
+        if not isinstance(data.get("rationale"), str):
+            data["rationale"] = "Apply minimal bug fix"
+
+    return data
+
+
 class MockAgentRuntime:
     """Deterministic agent runtime for unit tests, offline demos, and reproducible execution.
 
@@ -86,7 +267,10 @@ class MockAgentRuntime:
         elif role == "verifier":
             data = self._generate_mock_verification(request.context)
         else:
-            data = {"summary": f"Mock output for {role}", "details": request.context}
+            data = {
+                "summary": f"Mock output for {role}",
+                "details": request.context,
+            }
 
         duration = time.perf_counter() - start_time
         return AgentResult(
@@ -188,27 +372,188 @@ class MockAgentRuntime:
         }
 
 
+class OpenAICompatibleRuntime:
+    """Real AI Agent Runtime connecting to any OpenAI-compatible HTTP endpoint.
+
+    Supported Providers:
+    - OpenAI API (https://api.openai.com/v1)
+    - Local or remote Ollama (http://localhost:11434/v1)
+    - LiteLLM / vLLM / OpenRouter / Azure OpenAI / Groq
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        timeout_seconds: float = 30.0,
+        runtime_name: str | None = None,
+        http_handler: (
+            Callable[[urllib.request.Request, float], dict[str, Any]] | None
+        ) = None,
+    ) -> None:
+        self.api_key = (
+            api_key or os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+        )
+        self.base_url = (
+            base_url
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("LLM_BASE_URL")
+            or "https://api.openai.com/v1"
+        ).rstrip("/")
+        self.model = (
+            model
+            or os.getenv("OPENAI_MODEL")
+            or os.getenv("LLM_MODEL")
+            or "gpt-4o-mini"
+        )
+        self.timeout_seconds = timeout_seconds
+        self.runtime_name = runtime_name or f"openai/{self.model}"
+        self.http_handler = http_handler
+
+    def run_agent(self, request: AgentRequest) -> AgentResult:
+        start_time = time.perf_counter()
+        role = request.role.lower()
+
+        base_prompt = request.prompt_instruction or load_agent_prompt(role)
+        schema_spec = ROLE_SCHEMA_INSTRUCTIONS.get(role, "")
+
+        system_instruction = (
+            f"{base_prompt}\n\n"
+            f"STRICT OUTPUT REQUIREMENT:\n"
+            f"You MUST respond ONLY with a single valid JSON object strictly conforming to:\n"
+            f"{schema_spec}\n"
+            f"Do NOT include markdown formatting, explanations, or text outside the JSON object."
+        )
+
+        user_content = json.dumps(request.context, indent=2)
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": 0.1,
+        }
+
+        endpoint_url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "RepoRescue/0.1.0",
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        body_bytes = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            endpoint_url, data=body_bytes, headers=headers, method="POST"
+        )
+
+        try:
+            if self.http_handler:
+                raw_response = self.http_handler(req, self.timeout_seconds)
+            else:
+                with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                    resp_bytes = resp.read()
+                    raw_response = json.loads(resp_bytes.decode("utf-8"))
+        except urllib.error.HTTPError as err:
+            err_body = ""
+            try:
+                err_body = err.read().decode("utf-8", errors="replace")[:200]
+            except OSError as read_err:
+                logger.debug("Could not read HTTP error body: %s", read_err)
+            msg = f"HTTP {err.code} from {self.base_url}: {err.reason} ({err_body})"
+            logger.error("AI Provider error: %s", msg)
+            raise AgentNetworkError(msg) from err
+        except urllib.error.URLError as err:
+            msg = f"Connection error to {self.base_url}: {err.reason}"
+            logger.error("AI Provider connection failed: %s", msg)
+            raise AgentNetworkError(msg) from err
+        except TimeoutError as err:
+            msg = f"Request to {self.base_url} timed out after {self.timeout_seconds}s"
+            logger.error("AI Provider timeout: %s", msg)
+            raise AgentNetworkError(msg) from err
+
+        choices = raw_response.get("choices", [])
+        if not choices:
+            raise AgentResponseValidationError("Model response contains no choices.")
+        message_data = choices[0].get("message", {})
+        raw_text = message_data.get("content", "")
+
+        parsed_data = extract_json_payload(raw_text)
+        validated_data = validate_agent_payload(role, parsed_data)
+        duration = time.perf_counter() - start_time
+
+        return AgentResult(
+            role=role,
+            runtime_name=self.runtime_name,
+            structured_data=validated_data,
+            raw_text=raw_text,
+            execution_duration=duration,
+            is_simulation=False,
+        )
+
+
 class AgentRuntimeFactory:
     """Factory to provision agent runtimes depending on environment configuration."""
 
     @staticmethod
-    def get_runtime(preference: str | None = None) -> AgentRuntimeProtocol:
+    def get_runtime(
+        preference: str | None = None,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> AgentRuntimeProtocol:
         """Returns the appropriate runtime.
 
-        Defaults to MockAgentRuntime when offline or no API keys exist.
+        Preference options:
+        - "mock": Deterministic MockAgentRuntime (is_simulation=True)
+        - "real": OpenAICompatibleRuntime (is_simulation=False); raises RuntimeConfigurationError if not configured
+        - None: Auto-detect. Uses real provider if OPENAI_API_KEY / LLM_API_KEY / OPENAI_BASE_URL is present, else mock.
         """
-        if preference == "mock" or os.getenv("REPORESCUE_FORCE_MOCK", "").lower() in (
+        force_mock = os.getenv("REPORESCUE_FORCE_MOCK", "").lower() in (
             "1",
             "true",
-        ):
+        )
+        if preference == "mock" or force_mock:
             logger.info("Using MockAgentRuntime (explicit mock mode)")
             return MockAgentRuntime()
 
-        # If future real provider keys are detected:
-        # e.g., GEMINI_API_KEY, OPENAI_API_KEY
-        # Since currently no external AI CLI or API keys exist in this environment,
-        # fallback gracefully to MockAgentRuntime with explicit logging.
+        key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+        custom_url = (
+            base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL")
+        )
+
+        if preference == "real":
+            if not key and not custom_url:
+                raise RuntimeConfigurationError(
+                    "Real AI runtime requested, but neither OPENAI_API_KEY (or LLM_API_KEY) "
+                    "nor OPENAI_BASE_URL (or LLM_BASE_URL) is configured in environment."
+                )
+            logger.info("Initializing real AI agent runtime (OpenAI-compatible)")
+            return OpenAICompatibleRuntime(
+                api_key=key,
+                base_url=custom_url,
+                model=model,
+                timeout_seconds=timeout_seconds,
+            )
+
+        # Auto-detect: if credentials are provided in env, use real provider
+        if key or custom_url:
+            logger.info(
+                "AI provider credentials detected. Using real OpenAI-compatible runtime."
+            )
+            return OpenAICompatibleRuntime(
+                api_key=key,
+                base_url=custom_url,
+                model=model,
+                timeout_seconds=timeout_seconds,
+            )
+
         logger.info(
-            "No external AI provider keys detected. Operating with deterministic MockAgentRuntime."
+            "No external AI provider keys or endpoints detected. Operating with deterministic MockAgentRuntime."
         )
         return MockAgentRuntime()

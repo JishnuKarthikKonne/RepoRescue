@@ -6,13 +6,13 @@ This document details the provider-neutral agent runtime architecture for RepoRe
 
 ## 1. Provider-Neutral Protocol Design
 
-RepoRescue decouples agent logic from specific AI models and vendors via `AgentRuntimeProtocol` in `reporescue.agent_runtime`:
+RepoRescue decouples agent workflow logic from specific AI models and vendors via `AgentRuntimeProtocol` in `reporescue.agent_runtime`:
 
 ```python
 class AgentRuntimeProtocol(Protocol):
     """Protocol for provider-neutral agent runtime execution."""
 
-    def invoke(self, request: AgentRequest) -> AgentResult:
+    def run_agent(self, request: AgentRequest) -> AgentResult:
         """Executes an agent task synchronously and returns structured output."""
         ...
 ```
@@ -20,42 +20,35 @@ class AgentRuntimeProtocol(Protocol):
 ### Request & Result Data Contracts
 
 ```python
-@dataclass
+@dataclass(frozen=True)
 class AgentRequest:
-    agent_name: (
-        str  # e.g., "triager", "investigator", "reproducer", "fixer", "verifier"
-    )
-    prompt: str  # System instructions loaded from agents/<name>.md
-    user_context: str  # Bug title, description, code snippets, triage results
-    repository_context: dict[str, Any] = field(default_factory=dict)
-    options: dict[str, Any] = field(default_factory=dict)
+    role: str  # "triager", "investigator", "reproducer", "fixer", "verifier"
+    context: dict[str, Any]
+    prompt_instruction: str = ""
 
 
-@dataclass
+@dataclass(frozen=True)
 class AgentResult:
-    agent_name: str
-    success: bool
-    output_text: str
-    structured_data: dict[str, Any] = field(default_factory=dict)
-    raw_response: Any = None
-    execution_time_seconds: float = 0.0
-    error: str | None = None
+    role: str
+    runtime_name: str
+    structured_data: dict[str, Any]
+    raw_text: str
+    execution_duration: float
     is_simulation: bool = False
-    runtime_name: str = "mock-deterministic"
 ```
 
 ---
 
-## 2. Agent Prompts
+## 2. Agent Prompts & Schema Injection
 
-Role prompts are located in the `agents/` directory:
+Role instructions are located in the `agents/` directory:
 - `agents/triager.md`: Classifies severity, identifies affected components, and defines acceptance criteria.
 - `agents/investigator.md`: Analyzes codebase structure, diagnoses root cause, and outlines reproduction strategies.
 - `agents/reproducer.md`: Designs minimal reproducer tests demonstrating failure before patching.
 - `agents/fixer.md`: Formulates minimal, surgical fixes avoiding collateral side effects.
 - `agents/verifier.md`: Inspects test runner output, verifies regression freedom, and formats approval evidence.
 
-Prompts are dynamically loaded at runtime using `load_agent_prompt(role_name)` with graceful fallbacks.
+Prompts are dynamically loaded at runtime using `load_agent_prompt(role_name)`. For real LLM providers, strict JSON schema instructions are appended to enforce structured response parsing.
 
 ---
 
@@ -64,64 +57,60 @@ Prompts are dynamically loaded at runtime using `load_agent_prompt(role_name)` w
 ### A. Deterministic Mock Runtime (`MockAgentRuntime`)
 - **Runtime Name**: `mock-deterministic`
 - **Simulation Flag**: `is_simulation = True`
-- **Purpose**: Offline development, unit testing, CI pipelines, and reliable hackathon demonstrations without live LLM costs or network dependencies.
+- **Purpose**: Offline development, unit testing, CI pipelines, and reproducible hackathon demonstrations without live LLM costs or network dependencies.
 - **Behavior**: Returns validated, reproducible JSON payloads matching the seeded checkout coupon bug scenario in `demo_repo/`.
 
-### B. Factory Creation
+### B. Real AI Provider Runtime (`OpenAICompatibleRuntime`)
+- **Runtime Name**: `openai/<model>` (e.g. `openai/gpt-4o-mini`)
+- **Simulation Flag**: `is_simulation = False`
+- **Supported Providers**:
+  - OpenAI API (`https://api.openai.com/v1`)
+  - Local or remote Ollama (`http://localhost:11434/v1`)
+  - LiteLLM / vLLM / OpenRouter / Azure OpenAI / Groq
+- **Implementation**: Built entirely with Python's standard library `urllib.request` (zero third-party dependency overhead).
+- **Features**:
+  - Injects role-specific JSON schema contracts into model system prompts.
+  - Robust JSON extraction from raw strings, markdown code blocks, or substring braces.
+  - Validates all responses against typed schema rules before passing to the orchestrator.
+  - Enforces configurable HTTP timeouts (default: 30.0s).
+
+---
+
+## 4. Factory Configuration & Usage
+
+Use `AgentRuntimeFactory.get_runtime()` to instantiate the appropriate adapter:
+
 ```python
 from reporescue.agent_runtime import AgentRuntimeFactory
 
-# Explicit mock runtime
-runtime = AgentRuntimeFactory.create("mock")
+# 1. Force deterministic mock mode (for offline tests/demos)
+mock_runtime = AgentRuntimeFactory.get_runtime("mock")
 
-# Auto-detection (checks environment variables for OpenAI, Anthropic, or Gemini)
-runtime = AgentRuntimeFactory.create()
+# 2. Force real AI provider (raises RuntimeConfigurationError if unconfigured)
+real_runtime = AgentRuntimeFactory.get_runtime("real")
+
+# 3. Auto-detection (uses real provider if OPENAI_API_KEY/LLM_BASE_URL is present, else mock)
+runtime = AgentRuntimeFactory.get_runtime()
+```
+
+### CLI Execution
+```powershell
+# Run with deterministic mock simulation (default for demos)
+python -m reporescue.cli --mock --demo
+
+# Run with real AI provider (requires OPENAI_API_KEY or LLM_BASE_URL)
+python -m reporescue.cli --listen --real
+# Or:
+python -m reporescue.cli --mock --demo --real
 ```
 
 ---
 
-## 4. Connecting Real LLM Providers
+## 5. Fixer Safety Invariants
 
-To connect a live provider, implement `AgentRuntimeProtocol` or extend `AgentRuntimeFactory`:
+AI-generated patches undergo rigorous containment validation via `validate_safe_worktree_file` before application:
 
-### OpenAI / Compatible Endpoint
-```python
-import os
-import json
-from openai import OpenAI
-from reporescue.agent_runtime import AgentRequest, AgentResult
-
-
-class OpenAIAgentRuntime:
-    def __init__(self, model: str = "gpt-4o"):
-        self.client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        self.model = model
-
-    def invoke(self, request: AgentRequest) -> AgentResult:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": request.prompt},
-                {"role": "user", "content": request.user_context},
-            ],
-            response_format={"type": "json_object"},
-        )
-        content = response.choices[0].message.content or "{}"
-        data = json.loads(content)
-        return AgentResult(
-            agent_name=request.agent_name,
-            success=True,
-            output_text=content,
-            structured_data=data,
-            is_simulation=False,
-            runtime_name=f"openai/{self.model}",
-        )
-```
-
----
-
-## 5. Security & Safety Boundaries
-
-1. **No Direct Shell Execution by LLMs**: Agents never construct or execute raw shell strings. Code generation produces file modifications and test definitions that are safely written to isolated worktrees and invoked through `runner.run_command`.
-2. **Credential Sanitization**: Agent prompts and context never ingest raw API keys, Switch tokens, or system environment secrets.
-3. **Structured Validation**: All agent responses are parsed into strongly typed dataclasses (`TriageResult`, `InvestigationResult`, `ReproductionResult`, `FixResult`, `VerificationResult`). Invalid schemas fail the stage immediately before execution.
+1. **Worktree Confinement**: All target files must strictly resolve inside the isolated worktree directory (`wt.path`). Absolute paths or directory traversals (`../`) are immediately rejected with `FixerSafetyError`.
+2. **Protected Target Shielding**: AI patches cannot modify `.git/`, `.reporescue/`, `.venv/`, `.env`, or build cache directories.
+3. **No Shell Execution by Models**: AI output never constructs or executes shell commands. Only predetermined test runners (`run_pytest`) and diff inspections (`git diff`) are executed.
+4. **Independent Verification**: The orchestrator never trusts model claims regarding test results. An independent execution of `run_pytest` must exit with code 0, 0 failures, and at least 1 passing test before the task can advance to human approval.

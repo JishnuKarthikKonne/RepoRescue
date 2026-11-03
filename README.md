@@ -52,7 +52,11 @@ ruff check .
 ### 1. Interactive Demo Simulation (Recommended for Evaluation)
 Runs the complete autonomous multi-agent pipeline on a seeded bug in `demo_repo/`, executing real worktree operations and real pytest subprocess commands:
 ```powershell
+# Run with deterministic mock simulation (default for offline demos)
 python -m reporescue.cli --mock --demo
+
+# Run with real AI provider (requires OPENAI_API_KEY or LLM_BASE_URL)
+python -m reporescue.cli --mock --demo --real
 ```
 
 ### 2. Offline Mock Listener
@@ -67,6 +71,8 @@ Starts listening for inbound bug reports in the configured live Switch/Mattermos
 python -m reporescue.cli --listen
 # Or specify room override:
 python -m reporescue.cli --listen --room-id "!reporescue:localhost"
+# Use real AI agent runtime:
+python -m reporescue.cli --listen --real
 ```
 
 ---
@@ -95,13 +101,15 @@ python -m reporescue.cli --listen --room-id "!reporescue:localhost"
 
 ### 2. Provider-Neutral Agent Runtime (`reporescue.agent_runtime`)
 - Decouples workflow logic from AI vendors via `AgentRuntimeProtocol`.
-- Ships with `MockAgentRuntime` (`mock-deterministic`, `is_simulation=True`) for offline testing and reliable hackathon demos.
-- Supports pluggable adapters for live LLMs (OpenAI, Claude, Gemini).
+- **Deterministic Mock Runtime** (`MockAgentRuntime`, `is_simulation=True`): For reliable offline development, automated tests, and reproducible demos.
+- **Real AI Provider Runtime** (`OpenAICompatibleRuntime`, `is_simulation=False`): Connects to OpenAI API, local/remote Ollama, LiteLLM, vLLM, or Azure endpoints via standard `urllib.request`.
+- Injects strict JSON schema instructions, validates typed structured outputs, and catches network timeouts.
 - Role-specific system instructions loaded directly from `agents/*.md`.
 
-### 3. Git Worktree Isolation (`reporescue.git_ops`)
+### 3. Git Worktree Isolation & Fixer Safety (`reporescue.git_ops`, `reporescue.orchestrator`)
 - **Pristine Main Working Tree**: Never touches the main repository working tree.
 - **Dedicated Worktrees**: All isolated worktrees are located under `.reporescue/worktrees/` and automatically excluded in `.git/info/exclude`.
+- **Fixer Safety Guard**: Rejects directory traversals (`../`), absolute paths, and modifications to protected targets (`.git`, `.env`, `.reporescue`).
 - **Data Loss Prevention**: Worktrees containing uncommitted modifications cannot be removed without explicit confirmation.
 
 ### 4. Safe Command Execution Engine (`reporescue.runner`)

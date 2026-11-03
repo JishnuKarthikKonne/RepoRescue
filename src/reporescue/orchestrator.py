@@ -39,6 +39,60 @@ class VerificationFailedError(OrchestratorError):
     """Raised when verification tests fail on the proposed fix."""
 
 
+class FixerSafetyError(OrchestratorError):
+    """Raised when an AI-proposed fix or test path violates safety invariants."""
+
+
+PROTECTED_ROOT_DIRS = (
+    ".git",
+    ".reporescue",
+    ".venv",
+    ".pytest_cache",
+    ".ruff_cache",
+)
+PROTECTED_EXACT_FILES = {".env", ".env.local"}
+
+
+def validate_safe_worktree_file(worktree_path: Path, relative_path: str) -> Path:
+    """Validates that relative_path is safe, strictly confined to worktree_path, and does not touch protected targets.
+
+    Raises:
+        FixerSafetyError: if path escapes worktree, is absolute, or targets protected directories/files.
+    """
+    if not relative_path or not relative_path.strip():
+        raise FixerSafetyError("Empty file path provided.")
+
+    rel = relative_path.strip().replace("\\", "/")
+    if rel.startswith(("/", "../")) or "/../" in rel or rel == "..":
+        raise FixerSafetyError(f"Path traversal detected in file path: {relative_path}")
+
+    # Check for drive colon on Windows (e.g., C:)
+    if ":" in rel:
+        raise FixerSafetyError(
+            f"Absolute or drive-qualified path rejected: {relative_path}"
+        )
+
+    target = (worktree_path / rel).resolve()
+    wt_resolved = worktree_path.resolve()
+
+    if not target.is_relative_to(wt_resolved) or target == wt_resolved:
+        raise FixerSafetyError(f"Path escapes worktree boundary: {relative_path}")
+
+    # Check protected directories / files
+    rel_parts = target.relative_to(wt_resolved).parts
+    if any(part in PROTECTED_ROOT_DIRS for part in rel_parts):
+        raise FixerSafetyError(
+            f"Modification of protected directory rejected: {relative_path}"
+        )
+
+    if target.name in PROTECTED_EXACT_FILES:
+        raise FixerSafetyError(
+            f"Modification of protected file rejected: {relative_path}"
+        )
+
+    return target
+
+
 class WorkflowOrchestrator:
     """Coordinates autonomous multi-agent engineering workflows for RepoRescue.
 
@@ -216,9 +270,9 @@ class WorkflowOrchestrator:
         test_file_rel = raw.get("test_file", "tests/test_reproduce_bug.py")
         test_code = raw.get("test_code", "")
 
-        # Materialize reproduction test inside the isolated worktree
+        # Materialize reproduction test inside the isolated worktree with boundary validation
+        target_test = validate_safe_worktree_file(wt.path, test_file_rel)
         if test_code:
-            target_test = wt.path / test_file_rel
             target_test.parent.mkdir(parents=True, exist_ok=True)
             target_test.write_text(test_code, encoding="utf-8")
 
@@ -296,8 +350,13 @@ class WorkflowOrchestrator:
 
         # In real demo / simulated fix, apply changes to files in worktree if provided
         file_patches: dict[str, str] = raw.get("file_contents", {})
+        if not file_patches and not raw.get("diff"):
+            raise FixerSafetyError(
+                "Fixer response contains neither 'file_contents' nor 'diff'"
+            )
+
         for rel_path, content in file_patches.items():
-            fpath = wt.path / rel_path
+            fpath = validate_safe_worktree_file(wt.path, rel_path)
             fpath.parent.mkdir(parents=True, exist_ok=True)
             fpath.write_text(content, encoding="utf-8")
 
@@ -361,7 +420,9 @@ class WorkflowOrchestrator:
             failed_count = int(fail_match.group(1))
 
         # Strict safety invariant: Never mark verified if verification has not actually succeeded
-        is_verified = (test_run.exit_code == 0) and (failed_count == 0)
+        is_verified = (
+            (test_run.exit_code == 0) and (failed_count == 0) and (passed_count > 0)
+        )
 
         verif_res = VerificationResult(
             passed_count=passed_count,

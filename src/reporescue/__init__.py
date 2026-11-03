@@ -1,11 +1,16 @@
 """RepoRescue: Human-approved collaborative AI bug-fixing workflow."""
 
 from .agent_runtime import (
+    AgentNetworkError,
     AgentRequest,
+    AgentResponseValidationError,
     AgentResult,
+    AgentRuntimeError,
     AgentRuntimeFactory,
     AgentRuntimeProtocol,
     MockAgentRuntime,
+    OpenAICompatibleRuntime,
+    RuntimeConfigurationError,
 )
 from .demo import init_demo_repository
 from .git_ops import (
@@ -18,10 +23,12 @@ from .git_ops import (
 )
 from .models import BugTask, TaskStatus
 from .orchestrator import (
+    FixerSafetyError,
     InvalidStageOrderError,
     OrchestratorError,
     VerificationFailedError,
     WorkflowOrchestrator,
+    validate_safe_worktree_file,
 )
 from .runner import ExecutionResult, run_command, run_pytest
 from .schemas import (
@@ -48,22 +55,28 @@ from .switch import (
 )
 
 __all__ = [
+    "AgentNetworkError",
     "AgentRequest",
+    "AgentResponseValidationError",
     "AgentResult",
+    "AgentRuntimeError",
     "AgentRuntimeFactory",
     "AgentRuntimeProtocol",
     "BugTask",
     "ExecutionResult",
     "FixResult",
+    "FixerSafetyError",
     "GitError",
     "InvalidStageOrderError",
     "InvalidWorktreePathError",
     "InvestigationResult",
     "MockAgentRuntime",
     "MockSwitchClient",
+    "OpenAICompatibleRuntime",
     "OrchestratorError",
     "RepoRescueDispatcher",
     "ReproductionResult",
+    "RuntimeConfigurationError",
     "StageExecutionResult",
     "SwitchAuthError",
     "SwitchClient",
@@ -87,4 +100,5 @@ __all__ = [
     "init_demo_repository",
     "run_command",
     "run_pytest",
+    "validate_safe_worktree_file",
 ]

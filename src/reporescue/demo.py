@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 DEMO_REPRO_TEST_CODE = """from shop.checkout import calculate_order_total
 
@@ -33,6 +35,17 @@ def calculate_order_total(items: list[dict[str, float]], coupon_code: str | None
 """
 
 
+def _handle_remove_readonly(func: Any, path: str, exc_info: Any) -> None:
+    """Clear readonly bit and retry file removal on Windows."""
+    import stat
+
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except OSError:
+        pass
+
+
 def init_demo_repository(target_path: Path | str) -> Path:
     """Initializes a standalone Git repository from demo_repo files with an initial commit.
 
@@ -43,6 +56,14 @@ def init_demo_repository(target_path: Path | str) -> Path:
         Path to the initialized Git demo repository.
     """
     dest = Path(target_path).resolve()
+
+    # If previous demo repo exists, clean it up to ensure pristine baseline
+    if dest.exists():
+        try:
+            shutil.rmtree(dest, onexc=_handle_remove_readonly)
+        except OSError:
+            pass
+
     dest.mkdir(parents=True, exist_ok=True)
 
     # Locate source demo_repo template
