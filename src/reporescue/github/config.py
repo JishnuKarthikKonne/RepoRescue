@@ -134,14 +134,6 @@ class GitHubConfig:
         Strictly enforces multi-repository isolation: demo repositories never inherit
         the parent orchestrator repository target.
         """
-        token = (
-            os.getenv("GITHUB_TOKEN", "").strip()
-            or os.getenv("GH_TOKEN", "").strip()
-            or None
-        )
-        token_source = "environment" if token else None
-        token_username: str | None = None
-
         base_branch = (
             os.getenv("GITHUB_BASE_BRANCH", "").strip()
             or os.getenv("REPORESCUE_BASE_BRANCH", "").strip()
@@ -156,13 +148,39 @@ class GitHubConfig:
             "yes",
         )
 
-        # Fallback to local Git Credential Manager if no explicit token is in environment
-        if not token and not dry_run:
+        cred_pref = os.getenv("GITHUB_CREDENTIAL_SOURCE", "").strip().lower()
+        token: str | None = None
+        token_source: str | None = None
+        token_username: str | None = None
+
+        if cred_pref == "gcm":
             gcm_user, gcm_token = resolve_gcm_token(repo_path)
             if gcm_token:
                 token = gcm_token
                 token_source = "gcm"
                 token_username = gcm_user
+        elif cred_pref == "env":
+            token = (
+                os.getenv("GITHUB_TOKEN", "").strip()
+                or os.getenv("GH_TOKEN", "").strip()
+                or None
+            )
+            token_source = "environment" if token else None
+        else:
+            token = (
+                os.getenv("GITHUB_TOKEN", "").strip()
+                or os.getenv("GH_TOKEN", "").strip()
+                or None
+            )
+            token_source = "environment" if token else None
+
+            # Fallback to local Git Credential Manager if no explicit token is in environment
+            if not token and not dry_run:
+                gcm_user, gcm_token = resolve_gcm_token(repo_path)
+                if gcm_token:
+                    token = gcm_token
+                    token_source = "gcm"
+                    token_username = gcm_user
 
         allowlist_raw = os.getenv("GITHUB_REPO_ALLOWLIST", "").strip()
         repository_allowlist = (

@@ -575,19 +575,14 @@ class WorkflowOrchestrator:
         """Returns True if GitHub PR publishing is configured."""
         if self.github_manager is not None:
             return getattr(self.github_manager.config, "is_configured", False)
-        try:
-            from .github.config import GitHubConfig
-
-            return GitHubConfig.from_env(self.repo_path).is_configured
-        except Exception:  # noqa: BLE001
-            return False
+        return False
 
     def publish_draft_pr(self, task: BugTask) -> Any:
         """Publishes the approved bug fix as a GitHub DRAFT Pull Request."""
         if not self.github_manager:
-            from .github.manager import GitHubPRManager
-
-            self.github_manager = GitHubPRManager(worktree_mgr=self.worktree_mgr)
+            raise RuntimeError(
+                "GitHub PR Manager is not configured. An explicit GitHubPRManager must be attached."
+            )
 
         wt = self._get_task_worktree(task)
         runtime_name = getattr(self.runtime, "runtime_name", "mock")

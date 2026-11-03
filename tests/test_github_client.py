@@ -279,3 +279,78 @@ def test_preflight_git_receive_pack_dry_run_fails_with_permission_denied(tmp_pat
         assert res.git_smart_http_authorized is False
         assert res.status_code == 403
         assert "Permission to owner/repo.git denied to testuser" in res.error_message
+
+
+def test_github_rest_403_blocks_preflight():
+    """5. GitHub REST 403 blocks preflight and reports non-authorized."""
+    cfg = GitHubConfig(token="ghp_bad_role_token", repository="owner/repo")
+    client = GitHubClient(cfg)
+
+    http_error = urllib.error.HTTPError(
+        url="https://api.github.com/repos/owner/repo",
+        code=403,
+        msg="Forbidden",
+        hdrs={},
+        fp=MagicMock(
+            read=lambda: b'{"message": "Must have push access to repository"}'
+        ),
+    )
+
+    with patch("urllib.request.urlopen", side_effect=http_error):
+        res = client.preflight_git_receive_pack()
+        assert res.api_authenticated is False
+        assert res.api_push_permission is False
+        assert res.git_smart_http_authorized is False
+
+
+def test_github_invalid_token_401_raises_auth_error():
+    """4. Invalid token (HTTP 401) raises GitHubAuthError and masks token."""
+    secret_token = "ghp_invalid_expired_token_000"
+    cfg = GitHubConfig(token=secret_token, repository="owner/repo")
+    client = GitHubClient(cfg)
+
+    http_error = urllib.error.HTTPError(
+        url="https://api.github.com/repos/owner/repo",
+        code=401,
+        msg="Unauthorized",
+        hdrs={},
+        fp=MagicMock(
+            read=lambda: f'{{"message": "Bad credentials for {secret_token}"}}'.encode()
+        ),
+    )
+
+    with patch("urllib.request.urlopen", side_effect=http_error):
+        with pytest.raises(GitHubAuthError) as exc_info:
+            client.check_auth_and_repo()
+        assert secret_token not in str(exc_info.value)
+        assert "***" in str(exc_info.value)
+
+
+def test_github_config_credential_source_gcm_override(monkeypatch):
+    """8. GITHUB_CREDENTIAL_SOURCE=gcm forces GCM even if GITHUB_TOKEN is present."""
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_ambient_shadowing_token")
+    monkeypatch.setenv("GITHUB_CREDENTIAL_SOURCE", "gcm")
+
+    with patch(
+        "reporescue.github.config.resolve_gcm_token",
+        return_value=("JishnuKarthikKonne", "gho_valid_gcm_token"),
+    ):
+        cfg = GitHubConfig.from_env()
+        assert cfg.token == "gho_valid_gcm_token"
+        assert cfg.token_source == "gcm"
+        assert cfg.token_username == "JishnuKarthikKonne"
+
+
+def test_github_config_no_credentials_available(monkeypatch):
+    """9. When no credential exists in env or GCM, is_configured is False."""
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    monkeypatch.setenv("GITHUB_CREDENTIAL_SOURCE", "env")
+
+    cfg = GitHubConfig.from_env()
+    assert cfg.token is None
+    assert cfg.token_source is None
+    assert cfg.is_configured is False
+    errors = cfg.validate()
+    assert any("token is missing" in e.lower() for e in errors)

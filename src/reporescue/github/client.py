@@ -187,6 +187,8 @@ class GitHubClient:
         with contextlib.suppress(Exception):
             user_data = self._make_request("/user", method="GET")
             api_username = user_data.get("login")
+            if api_username and not self.config.token_username:
+                self.config.token_username = api_username
 
         if self.config.dry_run:
             return GitPushPreflightResult(

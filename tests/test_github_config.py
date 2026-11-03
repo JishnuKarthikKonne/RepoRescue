@@ -55,12 +55,49 @@ def test_github_config_from_env(monkeypatch: pytest.MonkeyPatch):
 
 def test_github_config_gh_token_fallback(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
     monkeypatch.setenv("GH_TOKEN", "ghp_fallback_token_12345")
     monkeypatch.setenv("REPORESCUE_GITHUB_REPO", "owner/fallback-repo")
 
     cfg = GitHubConfig.from_env()
     assert cfg.token == "ghp_fallback_token_12345"
     assert cfg.repository == "owner/fallback-repo"
+
+
+def test_github_config_repository_precedence_github_repo_over_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GH_TOKEN", "ghp_test_123")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "primary-org/primary-repo")
+    monkeypatch.setenv("REPORESCUE_GITHUB_REPO", "secondary-org/secondary-repo")
+
+    cfg = GitHubConfig.from_env()
+    assert cfg.repository == "primary-org/primary-repo"
+
+
+def test_github_config_token_precedence_github_token_over_gh_token(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_primary_token_999")
+    monkeypatch.setenv("GH_TOKEN", "ghp_secondary_token_111")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "org/repo")
+
+    cfg = GitHubConfig.from_env()
+    assert cfg.token == "ghp_primary_token_999"
+
+
+def test_github_config_repository_fallback_to_detected_origin(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+    monkeypatch.delenv("REPORESCUE_GITHUB_REPO", raising=False)
+
+    # When no explicit repository is set in env, from_env uses cwd git remote origin
+    cfg = GitHubConfig.from_env()
+    assert cfg.repository == "JishnuKarthikKonne/RepoRescue"
 
 
 def test_github_config_validation_errors():
