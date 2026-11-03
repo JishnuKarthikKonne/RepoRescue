@@ -35,3 +35,16 @@ class GitHubPRResult:
     def __post_init__(self) -> None:
         if not self.created_at:
             object.__setattr__(self, "created_at", datetime.now(UTC).isoformat())
+
+
+@dataclass(frozen=True)
+class GitPushPreflightResult:
+    """Detailed preflight assessment distinguishing REST API role from Git Smart HTTP authorization."""
+
+    api_authenticated: bool
+    api_username: str | None = None
+    api_push_permission: bool = False
+    git_smart_http_authorized: bool = False
+    status_code: int = 200
+    error_message: str | None = None
+    diagnostic_guidance: str | None = None

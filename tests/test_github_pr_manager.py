@@ -308,6 +308,7 @@ def test_push_branch_uses_basic_auth_in_env_and_never_in_cmd_args(
 
     # Invariant: Basic auth is provided in GIT_CONFIG_PARAMETERS in environment
     assert "GIT_CONFIG_PARAMETERS" in env
+    assert "credential.helper=" in env["GIT_CONFIG_PARAMETERS"]
     assert "Authorization: Basic" in env["GIT_CONFIG_PARAMETERS"]
     assert "GIT_TERMINAL_PROMPT" in env and env["GIT_TERMINAL_PROMPT"] == "0"
     assert "GCM_INTERACTIVE" in env and env["GCM_INTERACTIVE"] == "never"

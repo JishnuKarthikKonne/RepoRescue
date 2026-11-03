@@ -10,7 +10,7 @@ import urllib.request
 from typing import Any, Protocol
 
 from .config import GitHubConfig
-from .models import GitHubPRRequest, GitHubPRResult
+from .models import GitHubPRRequest, GitHubPRResult, GitPushPreflightResult
 
 logger = logging.getLogger("reporescue.github")
 
@@ -68,6 +68,10 @@ class GitHubClientProtocol(Protocol):
 
     def check_auth_and_repo(self) -> dict[str, Any]:
         """Validates credentials and repository access permissions."""
+        ...
+
+    def preflight_git_receive_pack(self) -> GitPushPreflightResult:
+        """Performs a safe preflight check for Git Smart HTTP push capability."""
         ...
 
 
@@ -147,6 +151,124 @@ class GitHubClient:
             )
         endpoint = f"/repos/{self.config.repository}"
         return self._make_request(endpoint, method="GET")
+
+    def preflight_git_receive_pack(self) -> GitPushPreflightResult:
+        """Performs a safe, read-only preflight check for Git Smart HTTP push capability.
+
+        Queries GET /info/refs?service=git-receive-pack to verify that the token
+        holds Git data write permissions (e.g. Contents: Read & write or repo scope),
+        distinguishing account-level repository roles from actual token push authorization.
+        """
+        if not self.config.repository:
+            return GitPushPreflightResult(
+                api_authenticated=False,
+                api_push_permission=False,
+                git_smart_http_authorized=False,
+                error_message="Repository is not configured.",
+            )
+
+        # 1. Verify REST API connectivity & account permissions
+        api_username: str | None = None
+        api_push = False
+
+        try:
+            repo_info = self.check_auth_and_repo()
+            perms = repo_info.get("permissions", {})
+            api_push = bool(perms.get("push", False))
+        except GitHubError as err:
+            return GitPushPreflightResult(
+                api_authenticated=False,
+                api_push_permission=False,
+                git_smart_http_authorized=False,
+                error_message=str(err),
+            )
+
+        with contextlib.suppress(Exception):
+            user_data = self._make_request("/user", method="GET")
+            api_username = user_data.get("login")
+
+        if self.config.dry_run:
+            return GitPushPreflightResult(
+                api_authenticated=True,
+                api_username=api_username or "dry-run-user",
+                api_push_permission=api_push,
+                git_smart_http_authorized=True,
+                status_code=200,
+            )
+
+        # 2. Check Git Smart HTTP receive-pack service advertisement
+        repo_url = f"https://github.com/{self.config.repository}.git/info/refs?service=git-receive-pack"
+        headers = {
+            "User-Agent": "git/2.43.0 (RepoRescue-Preflight)",
+            "Accept": "application/x-git-receive-pack-advertisement",
+        }
+        if self.config.token:
+            auth_bytes = f"x-access-token:{self.config.token}".encode()
+            basic_auth = base64.b64encode(auth_bytes).decode("ascii")
+            headers["Authorization"] = f"Basic {basic_auth}"
+
+        req = urllib.request.Request(repo_url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(
+                req, timeout=self.config.push_timeout_seconds
+            ) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                body = resp.read().decode("utf-8", "replace")
+                if resp.status == 200 and (
+                    "git-receive-pack" in body or "git-receive-pack" in content_type
+                ):
+                    return GitPushPreflightResult(
+                        api_authenticated=True,
+                        api_username=api_username,
+                        api_push_permission=api_push,
+                        git_smart_http_authorized=True,
+                        status_code=200,
+                    )
+                return GitPushPreflightResult(
+                    api_authenticated=True,
+                    api_username=api_username,
+                    api_push_permission=api_push,
+                    git_smart_http_authorized=False,
+                    status_code=resp.status,
+                    error_message=f"Unexpected Git Smart HTTP response (HTTP {resp.status})",
+                )
+        except urllib.error.HTTPError as err:
+            raw_err = err.read().decode("utf-8", "replace")
+            sanitized_err = _sanitize_message(raw_err, self.config.token)
+            if not sanitized_err.strip():
+                sanitized_err = f"HTTP {err.code}: {err.reason}"
+
+            guidance = None
+            if err.code == 403:
+                guidance = (
+                    "Root Cause: The configured Personal Access Token lacks Git write authorization for this repository.\n"
+                    "  • Fine-Grained Personal Access Token:\n"
+                    "    Verify 'Repository permissions' -> 'Contents' is set to 'Read and write'.\n"
+                    "  • Classic Personal Access Token:\n"
+                    "    Verify the 'repo' scope is enabled (Full control of private repositories).\n"
+                    "  • Organization / SAML Single Sign-On:\n"
+                    "    Verify the token is authorized for SAML SSO in your organization."
+                )
+
+            return GitPushPreflightResult(
+                api_authenticated=True,
+                api_username=api_username,
+                api_push_permission=api_push,
+                git_smart_http_authorized=False,
+                status_code=err.code,
+                error_message=f"Git Smart HTTP push permission denied (HTTP {err.code}): {sanitized_err.strip()}",
+                diagnostic_guidance=guidance,
+            )
+        except urllib.error.URLError as err:
+            sanitized_reason = _sanitize_message(str(err.reason), self.config.token)
+            return GitPushPreflightResult(
+                api_authenticated=True,
+                api_username=api_username,
+                api_push_permission=api_push,
+                git_smart_http_authorized=False,
+                status_code=0,
+                error_message=f"Failed to connect to Git Smart HTTP service: {sanitized_reason}",
+            )
 
     def find_existing_pr(
         self, head_branch: str, base_branch: str | None = None
@@ -265,6 +387,39 @@ class MockGitHubClient:
         self.should_fail_auth: bool = False
         self.should_fail_not_found: bool = False
         self.should_rate_limit: bool = False
+        self.simulate_receive_pack_403: bool = False
+
+    def preflight_git_receive_pack(self) -> GitPushPreflightResult:
+        """Simulates Git Smart HTTP receive-pack preflight check."""
+        if self.should_fail_auth:
+            return GitPushPreflightResult(
+                api_authenticated=False,
+                api_push_permission=False,
+                git_smart_http_authorized=False,
+                status_code=401,
+                error_message="Authentication failed (HTTP 401).",
+            )
+        if self.simulate_receive_pack_403:
+            return GitPushPreflightResult(
+                api_authenticated=True,
+                api_username="mock-user",
+                api_push_permission=True,
+                git_smart_http_authorized=False,
+                status_code=403,
+                error_message=f"Git Smart HTTP push permission denied (HTTP 403) on '{self.config.repository}.git'.",
+                diagnostic_guidance=(
+                    "Root Cause: The configured Personal Access Token lacks Git write authorization for this repository.\n"
+                    "  • Fine-Grained Personal Access Token:\n"
+                    "    Verify 'Repository permissions' -> 'Contents' is set to 'Read and write'."
+                ),
+            )
+        return GitPushPreflightResult(
+            api_authenticated=True,
+            api_username="mock-user",
+            api_push_permission=True,
+            git_smart_http_authorized=True,
+            status_code=200,
+        )
 
     def check_auth_and_repo(self) -> dict[str, Any]:
         """Simulates GitHub repo metadata verification."""
