@@ -483,3 +483,396 @@ def test_approval_rejected_when_not_in_awaiting_approval_state():
     assert result.status == TaskStatus.REPORTED  # Did not change
     assert "Approval rejected" in mock_client.last_message_content
     assert "Mandatory verification tests must pass" in mock_client.last_message_content
+
+
+def test_switch_client_register_agent_success():
+    client = SwitchClient(SwitchConfig(server_url="http://localhost:65008"))
+    mock_resp = MagicMock()
+    mock_resp.__enter__.return_value = mock_resp
+    mock_resp.read.return_value = json.dumps(
+        {"id": "agent-live-uuid", "api_key": "live-api-key-123"}
+    ).encode("utf-8")
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        agent_id, api_key = client.register_agent("token-abc")
+        assert agent_id == "agent-live-uuid"
+        assert api_key == "live-api-key-123"
+        assert client.config.agent_id == "agent-live-uuid"
+        assert client.config.api_key == "live-api-key-123"
+
+
+def test_switch_client_register_agent_auth_error():
+    client = SwitchClient(SwitchConfig(server_url="http://localhost:65008"))
+    http_error = urllib.error.HTTPError(
+        url="http://localhost:65008/agents",
+        code=401,
+        msg="Unauthorized",
+        hdrs={},
+        fp=MagicMock(read=lambda: b'{"detail": "Invalid registration token"}'),
+    )
+
+    with (
+        patch("urllib.request.urlopen", side_effect=http_error),
+        pytest.raises(SwitchAuthError, match="Invalid registration token"),
+    ):
+        client.register_agent("invalid-token")
+
+
+def test_switch_client_register_agent_no_token(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("SWITCH_REGISTRATION_TOKEN", raising=False)
+    monkeypatch.delenv("AGENT_REGISTRATION_TOKEN", raising=False)
+    client = SwitchClient(SwitchConfig(server_url="http://localhost:65008"))
+    with pytest.raises(SwitchAuthError, match="no registration token provided"):
+        client.register_agent("")
+
+
+def test_switch_client_create_and_list_rooms():
+    client = SwitchClient(
+        SwitchConfig(
+            server_url="http://localhost:65008",
+            api_key="valid-key",
+            agent_id="reporescue-test",
+        )
+    )
+
+    # Mock create_room
+    create_resp = MagicMock()
+    create_resp.__enter__.return_value = create_resp
+    create_resp.read.return_value = json.dumps(
+        {"id": "room-42", "name": "Bug Reports"}
+    ).encode("utf-8")
+
+    # Mock list_rooms
+    list_resp = MagicMock()
+    list_resp.__enter__.return_value = list_resp
+    list_resp.read.return_value = json.dumps(
+        {"rooms": [{"id": "room-42", "name": "Bug Reports"}]}
+    ).encode("utf-8")
+
+    with patch("urllib.request.urlopen", side_effect=[create_resp, list_resp]):
+        room = client.create_room("Bug Reports", description="Testing")
+        assert room["id"] == "room-42"
+
+        rooms = client.list_rooms()
+        assert len(rooms) == 1
+        assert rooms[0]["id"] == "room-42"
+
+
+def test_dispatcher_is_self_message_guards():
+    mock_client = MockSwitchClient(SwitchConfig(agent_id="reporescue-agent-id"))
+    dispatcher = RepoRescueDispatcher(mock_client)
+
+    # Direct agent ID match
+    evt_self_id = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room",
+            "payload": {
+                "body": "RepoRescue triage completed",
+                "sender": "reporescue-agent-id",
+                "sender_name": "RepoRescue",
+            },
+        }
+    )
+    assert evt_self_id is not None
+    assert dispatcher.is_self_message(evt_self_id) is True
+    assert dispatcher.handle_message_event(evt_self_id) is None
+
+    # Sender name contains reporescue
+    evt_self_name = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room",
+            "payload": {
+                "body": "Here is the fix card",
+                "sender": "@bot:localhost",
+                "sender_name": "RepoRescue Bot",
+            },
+        }
+    )
+    assert evt_self_name is not None
+    assert dispatcher.is_self_message(evt_self_name) is True
+    assert dispatcher.handle_message_event(evt_self_name) is None
+
+
+def test_dispatcher_active_room_filtering():
+    mock_client = MockSwitchClient()
+    dispatcher = RepoRescueDispatcher(mock_client, active_room_id="!engineering")
+
+    # Message from another room must be ignored
+    other_room_evt = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!random-chat",
+            "payload": {
+                "body": "Bug: ignore this in other room",
+                "sender": "@user:localhost",
+                "sender_name": "User",
+                "sender_kind": "user",
+            },
+        }
+    )
+    assert other_room_evt is not None
+    task = dispatcher.handle_message_event(other_room_evt)
+    assert task is None
+    assert len(dispatcher.tasks) == 0
+
+    # Message from active room is accepted
+    active_room_evt = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!engineering",
+            "payload": {
+                "body": "Bug: accept this in engineering room",
+                "sender": "@user:localhost",
+                "sender_name": "User",
+                "sender_kind": "user",
+            },
+        }
+    )
+    assert active_room_evt is not None
+    task = dispatcher.handle_message_event(active_room_evt)
+    assert task is not None
+    assert task.title == "accept this in engineering room"
+
+
+def test_dispatcher_non_human_bug_report_ignored():
+    mock_client = MockSwitchClient()
+    dispatcher = RepoRescueDispatcher(mock_client)
+
+    # Automated webhook / external agent tries to post bug report
+    bot_bug_evt = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room",
+            "payload": {
+                "body": "Bug: automated alert from monitoring",
+                "sender": "@monitor-bot:localhost",
+                "sender_name": "MonitoringBot",
+                "sender_kind": "agent",
+            },
+        }
+    )
+    assert bot_bug_evt is not None
+    task = dispatcher.handle_message_event(bot_bug_evt)
+    assert task is None
+    assert len(dispatcher.tasks) == 0
+
+
+def test_approval_with_explicit_task_id_matching():
+    mock_client = MockSwitchClient()
+    dispatcher = RepoRescueDispatcher(mock_client)
+
+    # Ingest task
+    task = dispatcher.handle_message_event(
+        SwitchMessageEvent.from_agent_event(
+            {
+                "type": "message",
+                "room_id": "!room",
+                "payload": {
+                    "body": "Bug: explicit id approval test",
+                    "sender": "@user:localhost",
+                    "sender_name": "User",
+                    "sender_kind": "user",
+                },
+            }
+        )
+    )
+    assert task is not None
+    for st in [
+        TaskStatus.TRIAGED,
+        TaskStatus.REPRODUCING,
+        TaskStatus.REPRODUCED,
+        TaskStatus.FIX_PROPOSED,
+        TaskStatus.VERIFYING,
+        TaskStatus.VERIFIED,
+        TaskStatus.AWAITING_APPROVAL,
+    ]:
+        task.transition(st, actor="system")
+
+    # Mismatched task ID
+    mismatch_evt = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room",
+            "payload": {
+                "body": "/approve non-existent-task-id",
+                "sender": "@lead:localhost",
+                "sender_name": "Lead",
+                "sender_kind": "user",
+            },
+        }
+    )
+    assert mismatch_evt is not None
+    res = dispatcher.handle_message_event(mismatch_evt)
+    assert res is None
+    assert task.status == TaskStatus.AWAITING_APPROVAL
+    assert "No active task awaiting approval found" in mock_client.last_message_content
+
+    # Matching task ID
+    match_evt = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room",
+            "payload": {
+                "body": f"/approve {task.task_id}",
+                "sender": "@lead:localhost",
+                "sender_name": "Lead",
+                "sender_kind": "user",
+            },
+        }
+    )
+    assert match_evt is not None
+    res = dispatcher.handle_message_event(match_evt)
+    assert res is not None
+    assert res.status == TaskStatus.APPROVED
+    assert res.approval_by == "Lead"
+
+
+def test_switch_config_registration_token_loading(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SWITCH_REGISTRATION_TOKEN", "reg_token_abc")
+    cfg = SwitchConfig.from_env()
+    assert cfg.registration_token == "reg_token_abc"
+
+    # Test AGENT_REGISTRATION_TOKEN fallback
+    monkeypatch.delenv("SWITCH_REGISTRATION_TOKEN")
+    monkeypatch.setenv("AGENT_REGISTRATION_TOKEN", "agent_reg_xyz")
+    cfg2 = SwitchConfig.from_env()
+    assert cfg2.registration_token == "agent_reg_xyz"
+
+
+def test_switch_client_register_agent_with_config_token():
+    cfg = SwitchConfig(
+        server_url="http://127.0.0.1:65008", registration_token="valid_token"
+    )
+    client = SwitchClient(cfg)
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(
+        {"id": "agent-reporescue-123", "api_key": "sw_key_xyz"}
+    ).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        agent_id, api_key = client.register_agent()
+        assert agent_id == "agent-reporescue-123"
+        assert api_key == "sw_key_xyz"
+        assert client.config.agent_id == "agent-reporescue-123"
+        assert client.config.api_key == "sw_key_xyz"
+
+        req: urllib.request.Request = mock_urlopen.call_args[0][0]
+        assert req.get_full_url() == "http://127.0.0.1:65008/agents"
+        assert req.headers["Authorization"] == "Bearer valid_token"
+
+
+def test_switch_client_register_agent_missing_token():
+    cfg = SwitchConfig(server_url="http://127.0.0.1:65008")
+    client = SwitchClient(cfg)
+    with pytest.raises(SwitchAuthError, match="no registration token provided"):
+        client.register_agent()
+
+
+def test_switch_client_create_and_list_rooms_with_list_resp():
+    cfg = SwitchConfig(
+        server_url="http://127.0.0.1:65008", agent_id="agent_123", api_key="key_123"
+    )
+    client = SwitchClient(cfg)
+
+    # Mock create_room
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(
+        {"id": "room_456", "name": "Bug Triage"}
+    ).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = client.create_room("Bug Triage", description="Discussion room")
+        assert res["id"] == "room_456"
+
+    # Mock list_rooms
+    mock_resp2 = MagicMock()
+    mock_resp2.read.return_value = json.dumps([{"id": "room_456"}]).encode("utf-8")
+    mock_resp2.__enter__.return_value = mock_resp2
+
+    with patch("urllib.request.urlopen", return_value=mock_resp2):
+        rooms = client.list_rooms()
+        assert len(rooms) == 1
+        assert rooms[0]["id"] == "room_456"
+
+
+def test_switch_client_get_room_history():
+    cfg = SwitchConfig(
+        server_url="http://127.0.0.1:65008", agent_id="agent_123", api_key="key_123"
+    )
+    client = SwitchClient(cfg)
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(
+        {"events": [{"id": "ev_1", "body": "hello"}]}
+    ).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        hist = client.get_room_history("room_456")
+        assert len(hist["events"]) == 1
+
+
+def test_mock_switch_client_room_management():
+    mock_client = MockSwitchClient()
+    agent_id, key = mock_client.register_agent()
+    assert "mock-agent" in agent_id
+    assert key == "mock-api-key"
+
+    room = mock_client.create_room("Triage Room")
+    assert "mock-room" in room["id"]
+    assert len(mock_client.list_rooms()) == 1
+    assert mock_client.get_room_history(room["id"]) == {"events": []}
+
+
+def test_dispatcher_self_message_filtering():
+    mock_client = MockSwitchClient(SwitchConfig(agent_id="reporescue"))
+    dispatcher = RepoRescueDispatcher(mock_client)
+
+    # 1. Message from reporescue sender
+    self_evt = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room",
+            "payload": {
+                "body": "Bug: Test bug reported by self",
+                "sender": "@reporescue:localhost",
+                "sender_name": "RepoRescue",
+                "sender_kind": "agent",
+            },
+        }
+    )
+    assert self_evt is not None
+    res = dispatcher.handle_message_event(self_evt)
+    assert res is None
+    assert len(dispatcher.tasks) == 0
+    assert len(mock_client.sent_messages) == 0
+
+
+def test_dispatcher_room_id_filtering():
+    mock_client = MockSwitchClient()
+    dispatcher = RepoRescueDispatcher(
+        mock_client, active_room_id="!designated-room:localhost"
+    )
+
+    # Message from another room
+    other_room_evt = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!unrelated-room:localhost",
+            "payload": {
+                "body": "Bug: In unrelated room",
+                "sender": "@user:localhost",
+                "sender_name": "User",
+                "sender_kind": "user",
+            },
+        }
+    )
+    assert other_room_evt is not None
+    res = dispatcher.handle_message_event(other_room_evt)
+    assert res is None
+    assert len(dispatcher.tasks) == 0

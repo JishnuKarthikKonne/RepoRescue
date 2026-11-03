@@ -42,13 +42,19 @@ class SwitchMessageEvent:
 
         # Check sender URI / identifier
         lower_sender = self.sender.lower().strip()
-        if lower_sender.startswith(("agent:", "bot:", "switch:", "system:")):
+        if (
+            lower_sender.startswith(
+                ("agent:", "bot:", "switch:", "system:", "@switch-agent-")
+            )
+            or "reporescue" in lower_sender
+        ):
             return False
 
         # Check display name
         lower_name = self.sender_name.lower().strip()
         return not (
             lower_name in ("reporescue", "switch", "system")
+            or "reporescue" in lower_name
             or lower_name.endswith("bot")
         )
 

@@ -210,10 +210,11 @@ class WorkflowOrchestrator:
         task.transition(TaskStatus.TRIAGED, actor="triager")
         task.evidence.append(f"Triage: {triage_res.severity} - {triage_res.summary}")
 
-        if self.dispatcher and self.room_id:
+        target_room = getattr(task, "room_id", None) or self.room_id
+        if self.dispatcher and target_room:
             self.dispatcher.publish_triage(
                 task.task_id,
-                self.room_id,
+                target_room,
                 severity=triage_res.severity,
                 acceptance_criteria=triage_res.acceptance_criteria,
                 affected_components=triage_res.affected_components,
@@ -272,10 +273,11 @@ class WorkflowOrchestrator:
         task.transition(TaskStatus.INVESTIGATED, actor="investigator")
         task.evidence.append(f"Investigation: {invest_res.probable_root_cause}")
 
-        if self.dispatcher and self.room_id:
+        target_room = getattr(task, "room_id", None) or self.room_id
+        if self.dispatcher and target_room:
             self.dispatcher.publish_investigation(
                 task.task_id,
-                self.room_id,
+                target_room,
                 root_cause=invest_res.probable_root_cause,
                 evidence=invest_res.evidence,
                 confidence=invest_res.confidence,
@@ -348,10 +350,11 @@ class WorkflowOrchestrator:
         task.transition(TaskStatus.REPRODUCED, actor="reproducer")
         task.evidence.append(f"Reproduction: exit={exit_code} on {test_file_rel}")
 
-        if self.dispatcher and self.room_id:
+        target_room = getattr(task, "room_id", None) or self.room_id
+        if self.dispatcher and target_room:
             self.dispatcher.publish_reproduction(
                 task.task_id,
-                self.room_id,
+                target_room,
                 test_file=repro_res.test_file,
                 exit_code=repro_res.exit_code,
                 output_snippet=repro_res.failure_evidence[:500],
@@ -436,10 +439,11 @@ class WorkflowOrchestrator:
         task.transition(TaskStatus.FIX_PROPOSED, actor="fixer")
         task.evidence.append(f"Fix proposed on {wt.branch}: {rationale}")
 
-        if self.dispatcher and self.room_id:
+        target_room = getattr(task, "room_id", None) or self.room_id
+        if self.dispatcher and target_room:
             self.dispatcher.publish_fix_proposed(
                 task.task_id,
-                self.room_id,
+                target_room,
                 branch_name=fix_res.branch_name,
                 diff_snippet=fix_res.diff[:800],
                 rationale=fix_res.rationale,
@@ -491,13 +495,14 @@ class WorkflowOrchestrator:
             verified=is_verified,
         )
 
+        target_room = getattr(task, "room_id", None) or self.room_id
         if not is_verified:
             task.transition(TaskStatus.FAILED, actor="verifier")
             task.evidence.append(f"Verification FAILED: exit={test_run.exit_code}")
-            if self.dispatcher and self.room_id:
+            if self.dispatcher and target_room:
                 self.dispatcher.publish_verification(
                     task.task_id,
-                    self.room_id,
+                    target_room,
                     passed_count=passed_count,
                     failed_count=failed_count,
                     duration_s=test_run.duration_seconds,
@@ -514,10 +519,10 @@ class WorkflowOrchestrator:
             f"Verification PASSED: {passed_count} passed in {test_run.duration_seconds:.2f}s"
         )
 
-        if self.dispatcher and self.room_id:
+        if self.dispatcher and target_room:
             self.dispatcher.publish_verification(
                 task.task_id,
-                self.room_id,
+                target_room,
                 passed_count=passed_count,
                 failed_count=failed_count,
                 duration_s=test_run.duration_seconds,

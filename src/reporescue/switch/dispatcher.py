@@ -16,35 +16,67 @@ class RepoRescueDispatcher:
         self,
         client: SwitchClientProtocol,
         orchestrator: Any | None = None,
+        *,
+        active_room_id: str | None = None,
     ) -> None:
         self.client = client
         self.orchestrator = orchestrator
+        self.active_room_id = active_room_id
         self.tasks: dict[str, BugTask] = {}
         self.active_task_by_room: dict[str, str] = {}  # room_id -> task_id
+
+    def is_self_message(self, event: SwitchMessageEvent) -> bool:
+        """Determines if the event was sent by RepoRescue itself."""
+        if hasattr(self.client, "config"):
+            agent_id = getattr(self.client.config, "agent_id", "")
+            if agent_id and (agent_id in event.sender or agent_id == event.sender):
+                return True
+        lower_sender = event.sender.lower()
+        lower_name = event.sender_name.lower()
+        return "reporescue" in lower_sender or "reporescue" in lower_name
 
     def handle_message_event(self, event: SwitchMessageEvent) -> BugTask | None:
         """Processes an incoming Switch message event.
 
         Detects whether the message is a new bug report, an approval command, or a rejection command.
+        Strictly ignores self-messages, wrong rooms, and unauthorized automated bots.
         """
+        # 1. Ignore messages sent by RepoRescue itself to prevent infinite feedback loops
+        if self.is_self_message(event):
+            return None
+
+        # 2. Reject messages from unrelated rooms if an active room is configured
+        if self.active_room_id and event.room_id != self.active_room_id:
+            return None
+
         body = event.body.strip()
 
-        # Check for approval commands: /approve [task_id]
+        # 3. Check for approval commands: /approve [task_id]
         if re.match(r"^/approve(\s+[\w\-]+)?$", body, re.IGNORECASE):
             return self._handle_approval(event)
 
-        # Check for rejection commands: /reject [reason]
+        # 4. Check for rejection commands: /reject [reason]
         if re.match(r"^/reject(\s+.*)?$", body, re.IGNORECASE):
             return self._handle_rejection(event)
 
-        # Otherwise, treat as a bug report if in the room
+        # 5. Non-human messages (automated bots or agents) must NOT trigger new bug tasks
+        if not event.is_human_sender:
+            return None
+
+        # 6. Otherwise, treat as a bug report if in the room
         task = self._handle_new_bug_report(event)
 
         # If an orchestrator is attached, trigger autonomous workflow execution
         if self.orchestrator is not None and task is not None:
             try:
                 self.orchestrator.execute_full_workflow(task)
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:
+                import logging
+
+                logging.getLogger("reporescue.dispatcher").exception(
+                    "Workflow stopped on task %s", task.task_id
+                )
+                task.evidence.append(f"Workflow exception: {err}")
                 self.client.send_message(
                     event.room_id,
                     f"⚠️ Workflow stopped on task `{task.task_id}`: {err}",
@@ -68,6 +100,7 @@ class RepoRescueDispatcher:
             description=description,
             reporter=event.sender_name,
         )
+        task.room_id = event.room_id
         self.tasks[task.task_id] = task
         self.active_task_by_room[event.room_id] = task.task_id
 
@@ -94,7 +127,7 @@ class RepoRescueDispatcher:
             self.client.send_message(event.room_id, warn_msg)
             return None
 
-        task_id = self._resolve_target_task_id(event)
+        task_id = self._resolve_target_task_id(event, is_approval=True)
         if not task_id or task_id not in self.tasks:
             self.client.send_message(
                 event.room_id,
@@ -157,11 +190,16 @@ class RepoRescueDispatcher:
         )
         return task
 
-    def _resolve_target_task_id(self, event: SwitchMessageEvent) -> str | None:
+    def _resolve_target_task_id(
+        self, event: SwitchMessageEvent, *, is_approval: bool = False
+    ) -> str | None:
         """Resolves the task_id from command arguments or active room context."""
         parts = event.body.strip().split()
         if len(parts) > 1 and parts[1] in self.tasks:
             return parts[1]
+        if is_approval and len(parts) > 1:
+            # Explicit task_id provided but does not match any known task
+            return None
         return self.active_task_by_room.get(event.room_id)
 
     def publish_triage(

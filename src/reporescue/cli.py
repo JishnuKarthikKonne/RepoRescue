@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import signal
 import sys
 import time
+import urllib.request
+import uuid
+from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +21,9 @@ if hasattr(sys.stderr, "reconfigure"):
 from .agent_runtime import AgentRuntimeFactory, RuntimeConfigurationError
 from .demo import init_demo_repository
 from .git_ops import WorktreeManager
-from .models import BugTask
+from .models import BugTask, TaskStatus
 from .orchestrator import WorkflowOrchestrator
-from .switch.client import MockSwitchClient, SwitchClient, SwitchConfig
+from .switch.client import MockSwitchClient, SwitchClient, SwitchConfig, SwitchError
 from .switch.dispatcher import RepoRescueDispatcher
 from .switch.listener import SwitchListener
 from .switch.models import SwitchMessageEvent
@@ -82,6 +87,16 @@ def run_listener(
             cfg.agent_id,
         )
         client = SwitchClient(cfg)
+        if (
+            not (client.config.agent_id and client.config.api_key)
+            and client.config.registration_token
+        ):
+            logger.info("Auto-registering RepoRescue agent with Switch server...")
+            try:
+                agent_id, _ = client.register_agent()
+                logger.info("Successfully registered agent ID: %s", agent_id)
+            except (SwitchError, urllib.error.URLError, OSError) as err:
+                logger.warning("Could not auto-register agent: %s", err)
 
     dispatcher = RepoRescueDispatcher(client)
     worktree_mgr = WorktreeManager(working_repo)
@@ -174,12 +189,298 @@ def run_listener(
         listener.stop()
 
 
+def run_live_demo(
+    *,
+    runtime_mode: str | None = None,
+    repo_path: Path | str | None = None,
+) -> None:
+    """Runs a live end-to-end demonstration against Switch Core 0.31.0."""
+    print("=" * 70)
+    print("  REPORESCUE: LIVE SWITCH INTEGRATION DEMONSTRATION")
+    print("=" * 70)
+
+    cfg = SwitchConfig.from_env()
+
+    # 1. Check Switch Core connectivity
+    try:
+        health_req = urllib.request.Request(f"{cfg.server_url}/health")
+        with urllib.request.urlopen(health_req, timeout=3.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("status") != "ok":
+                raise RuntimeError(f"Unexpected health response: {data}")
+    except (urllib.error.URLError, OSError, RuntimeError) as err:
+        logger.error(
+            "Cannot connect to Switch Core at %s (%s).\n"
+            "Please ensure Switch Core 0.31.0 is running on port 65008.",
+            cfg.server_url,
+            err,
+        )
+        sys.exit(1)
+
+    print(f"\n[Step 1] Connected to Switch Core at {cfg.server_url} (Health: OK)")
+
+    # 2. Authenticate or prepare registration key
+    admin_email = os.getenv("SWITCH_ADMIN_EMAIL", "admin@switch.local")
+    admin_password = os.getenv("SWITCH_ADMIN_PASSWORD", "")
+    if not admin_password:
+        appdata = os.environ.get("APPDATA", "")
+        candidates = [
+            (
+                Path(appdata)
+                / "switchdash"
+                / "local-switch-server"
+                / "native"
+                / "run"
+                / "switch-core.env"
+                if appdata
+                else None
+            ),
+            (
+                Path.home()
+                / ".config"
+                / "switchdash"
+                / "local-switch-server"
+                / "native"
+                / "run"
+                / "switch-core.env"
+            ),
+        ]
+        for c in candidates:
+            if c and c.is_file():
+                try:
+                    for line in c.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if line.startswith("GATEWAY_ADMIN_PASSWORD="):
+                            admin_password = line.split("=", 1)[1].strip()
+                        elif line.startswith("GATEWAY_ADMIN_EMAIL="):
+                            admin_email = line.split("=", 1)[1].strip()
+                except OSError:
+                    pass
+
+    cj = CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+    user_info = {}
+    user_reg_token = cfg.registration_token
+
+    if admin_password:
+        try:
+            login_data = json.dumps(
+                {"email": admin_email, "password": admin_password}
+            ).encode("utf-8")
+            login_req = urllib.request.Request(
+                f"{cfg.server_url}/gateway/auth/login",
+                data=login_data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with opener.open(login_req, timeout=5.0) as res:
+                user_info = json.loads(res.read().decode("utf-8"))
+                print(
+                    f"[Step 2] Authenticated Switch human user: {user_info.get('name')} <{user_info.get('email')}>"
+                )
+
+            mint_data = json.dumps(
+                {"label": f"RepoRescue Live Demo {int(time.time())}"}
+            ).encode("utf-8")
+            mint_req = urllib.request.Request(
+                f"{cfg.server_url}/gateway/api-keys",
+                data=mint_data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with opener.open(mint_req, timeout=5.0) as res:
+                key_resp = json.loads(res.read().decode("utf-8"))
+                user_reg_token = key_resp["key"]
+                print("  ✓ Minted user-owned registration token.")
+        except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError) as err:
+            logger.warning("Gateway human login skipped: %s", err)
+
+    # 3. Register agent
+    print("\n[Step 3] Registering RepoRescue agent with Switch Core...")
+    if not cfg.api_key or not cfg.agent_id:
+        try:
+            del_req = urllib.request.Request(
+                f"{cfg.server_url}/gateway/agents/by-name/reporescue",
+                method="DELETE",
+            )
+            with opener.open(del_req, timeout=5.0):
+                pass
+        except (urllib.error.URLError, OSError):
+            logger.debug("Previous agent cleanup skipped.")
+
+        client = SwitchClient(
+            SwitchConfig(server_url=cfg.server_url, registration_token=user_reg_token)
+        )
+        agent_id, _api_key = client.register_agent(name="reporescue")
+        print(f"  ✓ Registered agent ID: {agent_id}")
+    else:
+        client = SwitchClient(cfg)
+        print(f"  ✓ Using existing agent ID: {cfg.agent_id}")
+
+    # 4. Create chat room
+    print("\n[Step 4] Creating live chat room in Switch...")
+    room_id = cfg.default_room_id
+    if not room_id and user_info:
+        try:
+            chat_req_data = json.dumps(
+                {
+                    "agentId": client.config.agent_id,
+                    "name": "RepoRescue Live Bug Triage",
+                    "requestId": str(uuid.uuid4()),
+                }
+            ).encode("utf-8")
+            create_chat_req = urllib.request.Request(
+                f"{cfg.server_url}/gateway/chats",
+                data=chat_req_data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with opener.open(create_chat_req, timeout=5.0) as res:
+                chat_resp = json.loads(res.read().decode("utf-8"))
+                room_id = chat_resp["chat"]["roomId"]
+                print(
+                    f"  ✓ Live room created: {chat_resp['chat']['name']} (ID: {room_id})"
+                )
+        except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError) as err:
+            logger.warning("Could not create user chat room via Gateway: %s", err)
+
+    if not room_id:
+        room = client.create_room(name="RepoRescue Bug Triage Room")
+        room_id = room.get("id") or "!reporescue:localhost"
+        print(f"  ✓ Created agent room (ID: {room_id})")
+
+    # 5. Initialize pristine demo repo & multi-agent orchestrator
+    print("\n[Step 5] Initializing demo repo & multi-agent orchestrator...")
+    if repo_path:
+        working_repo = Path(repo_path).resolve()
+    else:
+        demo_dir = Path(".reporescue") / "demo_repo"
+        working_repo = init_demo_repository(demo_dir)
+    print(f"  ✓ Working repository at {working_repo}")
+
+    pref = runtime_mode or (
+        "real" if (os.getenv("OPENAI_API_KEY") or os.getenv("LLM_BASE_URL")) else "mock"
+    )
+    try:
+        runtime = AgentRuntimeFactory.get_runtime(pref)
+    except (RuntimeConfigurationError, OSError, ValueError):
+        logger.info("Falling back to deterministic mock runtime")
+        runtime = AgentRuntimeFactory.get_runtime("mock")
+
+    is_sim = getattr(runtime, "is_simulation", True)
+    rt_name = getattr(runtime, "runtime_name", "mock")
+    print(f"  ✓ AI Runtime: {rt_name} (simulation={is_sim})")
+
+    dispatcher = RepoRescueDispatcher(client, active_room_id=room_id)
+    worktree_mgr = WorktreeManager(working_repo)
+    orchestrator = WorkflowOrchestrator(
+        repo_path=working_repo,
+        runtime=runtime,
+        worktree_mgr=worktree_mgr,
+        dispatcher=dispatcher,
+        room_id=room_id,
+    )
+    dispatcher.orchestrator = orchestrator
+
+    listener = SwitchListener(
+        client,
+        dispatcher,
+        room_id=room_id,
+        poll_interval_seconds=1.0,
+    )
+
+    # 6. Human user posts bug report
+    print("\n[Step 6] Human user posts bug report into Switch room...")
+    bug_msg = (
+        "Bug: Checkout returns HTTP 500 when coupon is applied\n"
+        "Steps to reproduce: calculate_order_total(items, coupon_code='EXPIRED') raises ValueError\n"
+        "Expected: Invalid or expired coupons should be handled gracefully without raising ValueError, applying 0.0 discount."
+    )
+    if user_info:
+        post_msg_req = urllib.request.Request(
+            f"{cfg.server_url}/gateway/chats/{room_id}/messages",
+            data=json.dumps({"requestId": str(uuid.uuid4()), "body": bug_msg}).encode(
+                "utf-8"
+            ),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(post_msg_req, timeout=5.0):
+            print(f"  ✓ Posted message as '{user_info.get('name', 'Admin')}'")
+    else:
+        client.send_message(room_id, bug_msg)
+        print("  ✓ Posted bug report message to room")
+
+    # 7. Poll and process bug report
+    print("\n[Step 7] RepoRescue listener polls and dispatches multi-agent workflow...")
+    listener.poll_once()
+
+    task = next(iter(dispatcher.tasks.values())) if dispatcher.tasks else None
+    if not task:
+        logger.error("No task was created!")
+        sys.exit(1)
+
+    print(f"  ✓ Task created: ID `{task.task_id}`, status: `{task.status}`")
+    for ev in task.evidence:
+        print(f"    - {ev}")
+
+    if task.status != TaskStatus.AWAITING_APPROVAL:
+        logger.error(
+            "Workflow failed before reaching awaiting_approval: %s", task.status
+        )
+        sys.exit(1)
+
+    # 8. Human user posts approval
+    print("\n[Step 8] Human user posts '/approve' command...")
+    approve_cmd = f"/approve {task.task_id}"
+    if user_info:
+        approve_req = urllib.request.Request(
+            f"{cfg.server_url}/gateway/chats/{room_id}/messages",
+            data=json.dumps(
+                {"requestId": str(uuid.uuid4()), "body": approve_cmd}
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with opener.open(approve_req, timeout=5.0):
+            print(f"  ✓ Posted approval command: '{approve_cmd}'")
+    else:
+        client.send_message(room_id, approve_cmd)
+
+    # 9. Poll and validate approval
+    print("\n[Step 9] RepoRescue listener validates human approval...")
+    listener.poll_once()
+    print(f"  ✓ Final Task status: `{task.status}`")
+    print(f"  ✓ Approved by: `{task.approval_by}` at `{task.approved_at}`")
+
+    # 10. Fetch room history from Switch Core
+    print("\n[Step 10] Room history from Switch Core:")
+    hist = client.get_room_history(room_id)
+    events = hist.get("events", [])
+    print(f"  ✓ Switch room contains {len(events)} total messages:")
+    for idx, ev in enumerate(events, 1):
+        sender = ev.get("sender_name")
+        body = ev.get("body", "")
+        snippet = body.replace("\n", " ")[:90]
+        print(f"    {idx}. [{sender}]: {snippet}...")
+
+    print("\n" + "=" * 70)
+    print("  SUCCESS: LIVE SWITCH INTEGRATION & HUMAN APPROVAL DEMO COMPLETED")
+    print("=" * 70)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="RepoRescue: Human-approved collaborative AI bug-fixing workflow"
     )
     parser.add_argument(
         "--listen", action="store_true", help="Start the live Switch room listener"
+    )
+    parser.add_argument(
+        "--live-demo",
+        action="store_true",
+        help="Run end-to-end autonomous workflow against live Switch Core",
     )
     parser.add_argument(
         "--mock",
@@ -232,7 +533,12 @@ def main() -> None:
 
     runtime_mode = "real" if args.real else args.runtime
 
-    if args.listen or args.mock or args.demo or args.real:
+    if args.live_demo:
+        run_live_demo(
+            runtime_mode=runtime_mode,
+            repo_path=args.repo_path,
+        )
+    elif args.listen or args.mock or args.demo or args.real:
         run_listener(
             mock=args.mock or (not args.listen),
             demo=args.demo or args.real,

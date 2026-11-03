@@ -99,6 +99,10 @@ ROLE_SCHEMA_INSTRUCTIONS: dict[str, str] = {
     ),
     "fixer": (
         "Carefully inspect `repository_files` and `reproduction_evidence` in the context! Provide the complete updated file content of the actual module in repository_files (e.g. `src/shop/checkout.py`) to fix the bug without breaking existing tests.\n"
+        "CRITICAL FIX RULES:\n"
+        "1. Fix the problem directly and defensively so tests pass and no unhandled exceptions are raised.\n"
+        "2. Preserve existing function signatures, return types, and import statements.\n"
+        "3. Keep 'from __future__ import annotations' at the top of the file; never import builtin types like 'list', 'dict', 'float', 'str' from typing.\n"
         "Respond with a single JSON object containing:\n"
         '{\n  "changed_files": ["src/shop/checkout.py"],\n'
         '  "file_contents": {\n'

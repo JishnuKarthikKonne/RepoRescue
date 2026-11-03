@@ -20,8 +20,14 @@ This script provides an exact, step-by-step walkthrough for demonstrating RepoRe
    ```powershell
    pytest
    ```
-3. Run the automated demo simulation:
+3. Run the demonstration:
    ```powershell
+   # Mode A: Live Switch Core Integration (Live HTTP REST + Switch Room)
+   python -m reporescue.cli --live-demo --runtime mock
+   # Or with real local GPU AI:
+   python -m reporescue.cli --live-demo --real
+
+   # Mode B: Offline Deterministic Simulation
    python -m reporescue.cli --mock --demo
    ```
 

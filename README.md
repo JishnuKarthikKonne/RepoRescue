@@ -49,8 +49,18 @@ ruff check .
 
 ## Running the Application
 
-### 1. Interactive Demo Simulation (Recommended for Evaluation)
-Runs the complete autonomous multi-agent pipeline on a seeded bug in `demo_repo/`, executing real worktree operations and real pytest subprocess commands:
+### 1. Live Switch Core End-to-End Demo (Milestone 4 Live Verification)
+Executes an end-to-end bug report, multi-agent triage, worktree reproduction, fix, verification, and human approval flow directly through a live local Switch Core 0.31.0 room:
+```powershell
+# Run with deterministic mock runtime on live Switch Core
+python -m reporescue.cli --live-demo --runtime mock
+
+# Run with real local Ollama (qwen3:8b) on live Switch Core
+python -m reporescue.cli --live-demo --real
+```
+
+### 2. Interactive Offline Simulation (Zero Setup)
+Runs the complete autonomous multi-agent pipeline on a seeded bug in `demo_repo/`, executing real worktree operations and real pytest subprocess commands without requiring a running Switch server:
 ```powershell
 # Run with deterministic mock simulation (default for offline demos)
 python -m reporescue.cli --mock --demo
@@ -59,14 +69,14 @@ python -m reporescue.cli --mock --demo
 python -m reporescue.cli --mock --demo --real
 ```
 
-### 2. Offline Mock Listener
+### 3. Offline Mock Listener
 Starts the RepoRescue event loop using the offline mock Switch adapter:
 ```powershell
 python -m reporescue.cli --mock
 ```
 
-### 3. Live Switch Room Listener
-Starts listening for inbound bug reports in the configured live Switch/Mattermost room:
+### 4. Live Switch Room Listener
+Starts listening continuously for inbound bug reports in the configured live Switch room:
 ```powershell
 python -m reporescue.cli --listen
 # Or specify room override:
@@ -140,6 +150,7 @@ The repository includes a standalone Python package (`demo_repo/`) containing a 
 
 ## Documentation
 
+- [Switch Integration Guide](docs/switch-integration.md): Live Switch Core 0.31.0 protocol, endpoints, and human approval verification.
 - [Architecture Blueprint](docs/architecture.md): Detailed system diagram, stage contracts, and safety boundaries.
 - [Agent Runtime Guide](docs/agent-runtime.md): Provider protocol, prompt integration, and live LLM configuration.
 - [3-Minute Demo Script](docs/demo-script.md): Step-by-step presentation script for the hackathon.
