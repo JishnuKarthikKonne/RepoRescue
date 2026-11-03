@@ -7,6 +7,8 @@ from uuid import uuid4
 class TaskStatus(StrEnum):
     REPORTED = "reported"
     TRIAGED = "triaged"
+    INVESTIGATING = "investigating"
+    INVESTIGATED = "investigated"
     REPRODUCING = "reproducing"
     REPRODUCED = "reproduced"
     FIX_PROPOSED = "fix_proposed"
@@ -36,7 +38,13 @@ class BugTask:
     ) -> None:
         allowed = {
             TaskStatus.REPORTED: {TaskStatus.TRIAGED, TaskStatus.FAILED},
-            TaskStatus.TRIAGED: {TaskStatus.REPRODUCING, TaskStatus.FAILED},
+            TaskStatus.TRIAGED: {
+                TaskStatus.INVESTIGATING,
+                TaskStatus.REPRODUCING,
+                TaskStatus.FAILED,
+            },
+            TaskStatus.INVESTIGATING: {TaskStatus.INVESTIGATED, TaskStatus.FAILED},
+            TaskStatus.INVESTIGATED: {TaskStatus.REPRODUCING, TaskStatus.FAILED},
             TaskStatus.REPRODUCING: {TaskStatus.REPRODUCED, TaskStatus.FAILED},
             TaskStatus.REPRODUCED: {TaskStatus.FIX_PROPOSED, TaskStatus.FAILED},
             TaskStatus.FIX_PROPOSED: {TaskStatus.VERIFYING, TaskStatus.FAILED},

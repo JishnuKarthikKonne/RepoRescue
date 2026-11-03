@@ -105,19 +105,60 @@ class SwitchMessageEvent:
 
 
 class WorkflowFormatter:
-    """Formats standardized markdown cards for RepoRescue updates in Switch rooms."""
+    """Formats standardized, professional cards for RepoRescue updates in Switch rooms."""
+
+    @staticmethod
+    def format_ack_card(task_id: str, title: str, reporter: str) -> str:
+        return (
+            f"### RepoRescue | {task_id}\n\n"
+            f"**Bug accepted**\n"
+            f"**Title:** {title}\n"
+            f"**Reported by:** @{reporter}\n"
+            f"**Status:** Investigating & Triaging\n"
+        )
 
     @staticmethod
     def format_triage_card(
-        task_id: str, title: str, severity: str, acceptance_criteria: str
+        task_id: str,
+        title: str,
+        severity: str,
+        acceptance_criteria: str,
+        affected_components: list[str] | None = None,
     ) -> str:
+        comp_str = (
+            f"\n**Components:** {', '.join(affected_components)}"
+            if affected_components
+            else ""
+        )
         return (
-            f"### 🛡️ RepoRescue — Issue Triaged\n\n"
-            f"**Task ID:** `{task_id}`\n"
+            f"### RepoRescue | {task_id}\n\n"
+            f"**Issue Triaged**\n"
             f"**Title:** {title}\n"
-            f"**Severity:** `{severity}`\n"
+            f"**Severity:** `{severity}`"
+            f"{comp_str}\n"
             f"**Acceptance Criteria:** {acceptance_criteria}\n\n"
-            f"👉 *Reproducer agent assigned to create a minimal failing test.*"
+            f"👉 *Investigator assigned to determine root cause.*"
+        )
+
+    @staticmethod
+    def format_investigation_card(
+        task_id: str,
+        root_cause: str,
+        evidence: list[str],
+        confidence: str = "medium",
+    ) -> str:
+        evidence_lines = (
+            "\n".join(f"- {e}" for e in evidence)
+            if evidence
+            else "- Codebase inspection completed"
+        )
+        return (
+            f"### RepoRescue | {task_id}\n\n"
+            f"**Root cause identified**\n"
+            f"**Cause:** {root_cause}\n"
+            f"**Evidence:**\n{evidence_lines}\n"
+            f"**Confidence:** `{confidence}`\n\n"
+            f"👉 *Reproducer agent creating isolated failing test.*"
         )
 
     @staticmethod
@@ -125,22 +166,27 @@ class WorkflowFormatter:
         task_id: str, test_file: str, exit_code: int, output_snippet: str
     ) -> str:
         return (
-            f"### 🔬 RepoRescue — Bug Reproduced\n\n"
-            f"**Task ID:** `{task_id}`\n"
-            f"**Reproduction Script:** `{test_file}`\n"
-            f"**Exit Code:** `{exit_code}` (Expected failure)\n\n"
+            f"### RepoRescue | {task_id}\n\n"
+            f"**Bug Reproduced** (Reproduction successful)\n"
+            f"**Failing test:** `{test_file}`\n"
+            f"**Exit code:** `{exit_code}` (Expected reproduction failure)\n\n"
             f"```text\n{output_snippet.strip()}\n```\n\n"
             f"👉 *Fix agent dispatched to isolated Git worktree.*"
         )
 
     @staticmethod
     def format_fix_proposed_card(
-        task_id: str, branch: str, diff_snippet: str, rationale: str
+        task_id: str,
+        branch: str,
+        diff_snippet: str,
+        rationale: str,
+        files_changed_count: int = 1,
     ) -> str:
         return (
-            f"### 🛠️ RepoRescue — Fix Proposed\n\n"
-            f"**Task ID:** `{task_id}`\n"
-            f"**Isolated Branch:** `{branch}`\n"
+            f"### RepoRescue | {task_id}\n\n"
+            f"**Fix Proposed**\n"
+            f"**Branch:** `{branch}`\n"
+            f"**Files changed:** {files_changed_count}\n"
             f"**Rationale:** {rationale}\n\n"
             f"```diff\n{diff_snippet.strip()}\n```\n\n"
             f"👉 *Verifier agent running independent test suite...*"
@@ -154,18 +200,20 @@ class WorkflowFormatter:
         duration_s: float,
         verified: bool,
     ) -> str:
+        status_text = "Verification complete" if verified else "Verification failed"
         status_icon = "✅" if verified else "❌"
-        status_text = (
-            "VERIFIED — All tests passed" if verified else "FAILED — Tests did not pass"
-        )
         return (
-            f"### {status_icon} RepoRescue — Verification Result\n\n"
-            f"**Task ID:** `{task_id}`\n"
-            f"**Status:** {status_text}\n"
-            f"**Test Results:** {passed_count} passed, {failed_count} failed in {duration_s:.2f}s\n\n"
+            f"### RepoRescue | {task_id}\n\n"
+            f"**{status_icon} {status_text}**\n"
+            f"**Tests passed:** {passed_count}\n"
+            f"**Tests failed:** {failed_count}\n"
+            f"**Duration:** {duration_s:.2f}s\n\n"
             f"> [!IMPORTANT]\n"
-            f"> **Human Approval Required**: RepoRescue never automatically merges or deploys code.\n"
-            f"> Reply with `/approve` to approve opening a draft Pull Request, or `/reject <reason>` to request revisions."
+            f"> **Human Approval Required**\n"
+            f"> Reply:\n"
+            f"> `/approve`\n"
+            f"> or\n"
+            f"> `/reject <reason>`"
         )
 
     @staticmethod
@@ -174,8 +222,8 @@ class WorkflowFormatter:
     ) -> str:
         ts_str = f" at `{timestamp.isoformat()}`" if timestamp else ""
         return (
-            f"### 👤 Human Approval Granted\n\n"
-            f"**Task ID:** `{task_id}`\n"
+            f"### RepoRescue | {task_id}\n\n"
+            f"**👤 Human Approval Granted**\n"
             f"**Approved By:** @{approver}{ts_str}\n"
             f"**Next Step:** Ready to open Pull Request with full reproduction and verification evidence."
         )

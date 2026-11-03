@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from reporescue.models import BugTask, TaskStatus
 
@@ -11,8 +12,13 @@ from .models import SwitchMessageEvent, WorkflowFormatter
 class RepoRescueDispatcher:
     """Dispatches Switch room events to RepoRescue workflow tasks and publishes status updates."""
 
-    def __init__(self, client: SwitchClientProtocol) -> None:
+    def __init__(
+        self,
+        client: SwitchClientProtocol,
+        orchestrator: Any | None = None,
+    ) -> None:
         self.client = client
+        self.orchestrator = orchestrator
         self.tasks: dict[str, BugTask] = {}
         self.active_task_by_room: dict[str, str] = {}  # room_id -> task_id
 
@@ -32,7 +38,20 @@ class RepoRescueDispatcher:
             return self._handle_rejection(event)
 
         # Otherwise, treat as a bug report if in the room
-        return self._handle_new_bug_report(event)
+        task = self._handle_new_bug_report(event)
+
+        # If an orchestrator is attached, trigger autonomous workflow execution
+        if self.orchestrator is not None and task is not None:
+            try:
+                self.orchestrator.execute_full_workflow(task)
+            except Exception as err:  # noqa: BLE001
+                self.client.send_message(
+                    event.room_id,
+                    f"⚠️ Workflow stopped on task `{task.task_id}`: {err}",
+                    metadata={"task_id": task.task_id, "status": "failed"},
+                )
+
+        return task
 
     def _handle_new_bug_report(self, event: SwitchMessageEvent) -> BugTask:
         """Creates a new BugTask and publishes initial acknowledgment to the room."""
@@ -152,16 +171,51 @@ class RepoRescueDispatcher:
         *,
         severity: str,
         acceptance_criteria: str,
+        affected_components: list[str] | None = None,
         actor: str = "triager",
     ) -> None:
         """Advances task to TRIAGED and posts triage card."""
-        task = self.tasks[task_id]
-        task.transition(TaskStatus.TRIAGED, actor=actor)
+        task = self.tasks.get(task_id)
+        if task and task.status == TaskStatus.REPORTED:
+            task.transition(TaskStatus.TRIAGED, actor=actor)
+        title = task.title if task else "Bug Report"
+
         card = WorkflowFormatter.format_triage_card(
-            task.task_id, task.title, severity, acceptance_criteria
+            task_id,
+            title,
+            severity,
+            acceptance_criteria,
+            affected_components=affected_components,
         )
         self.client.send_message(
             room_id, card, metadata={"task_id": task_id, "status": "triaged"}
+        )
+
+    def publish_investigation(
+        self,
+        task_id: str,
+        room_id: str,
+        *,
+        root_cause: str,
+        evidence: list[str],
+        confidence: str = "medium",
+        actor: str = "investigator",
+    ) -> None:
+        """Advances task through INVESTIGATING to INVESTIGATED and posts root cause evidence."""
+        task = self.tasks.get(task_id)
+        if task and task.status == TaskStatus.TRIAGED:
+            task.transition(TaskStatus.INVESTIGATING, actor=actor)
+            task.transition(TaskStatus.INVESTIGATED, actor=actor)
+            for ev in evidence:
+                task.evidence.append(f"Investigation: {ev}")
+
+        card = WorkflowFormatter.format_investigation_card(
+            task_id, root_cause, evidence, confidence=confidence
+        )
+        self.client.send_message(
+            room_id,
+            card,
+            metadata={"task_id": task_id, "status": "investigated"},
         )
 
     def publish_reproduction(
@@ -175,15 +229,16 @@ class RepoRescueDispatcher:
         actor: str = "reproducer",
     ) -> None:
         """Advances task to REPRODUCING then REPRODUCED and posts reproduction evidence."""
-        task = self.tasks[task_id]
-        task.transition(TaskStatus.REPRODUCING, actor=actor)
-        task.transition(TaskStatus.REPRODUCED, actor=actor)
-        task.evidence.append(
-            f"Reproduction: {test_file} (exit={exit_code})\n{output_snippet}"
-        )
+        task = self.tasks.get(task_id)
+        if task and task.status in (TaskStatus.TRIAGED, TaskStatus.INVESTIGATED):
+            task.transition(TaskStatus.REPRODUCING, actor=actor)
+            task.transition(TaskStatus.REPRODUCED, actor=actor)
+            task.evidence.append(
+                f"Reproduction: {test_file} (exit={exit_code})\n{output_snippet}"
+            )
 
         card = WorkflowFormatter.format_reproduction_card(
-            task.task_id, test_file, exit_code, output_snippet
+            task_id, test_file, exit_code, output_snippet
         )
         self.client.send_message(
             room_id, card, metadata={"task_id": task_id, "status": "reproduced"}
@@ -200,13 +255,14 @@ class RepoRescueDispatcher:
         actor: str = "fixer",
     ) -> None:
         """Advances task to FIX_PROPOSED and posts proposed patch."""
-        task = self.tasks[task_id]
-        task.proposed_branch = branch_name
-        task.transition(TaskStatus.FIX_PROPOSED, actor=actor)
-        task.evidence.append(f"Fix on branch {branch_name}:\n{diff_snippet}")
+        task = self.tasks.get(task_id)
+        if task and task.status in (TaskStatus.REPRODUCED, TaskStatus.REJECTED):
+            task.proposed_branch = branch_name
+            task.transition(TaskStatus.FIX_PROPOSED, actor=actor)
+            task.evidence.append(f"Fix on branch {branch_name}:\n{diff_snippet}")
 
         card = WorkflowFormatter.format_fix_proposed_card(
-            task.task_id, branch_name, diff_snippet, rationale
+            task_id, branch_name, diff_snippet, rationale
         )
         self.client.send_message(
             room_id, card, metadata={"task_id": task_id, "status": "fix_proposed"}
@@ -225,10 +281,17 @@ class RepoRescueDispatcher:
         actor: str = "verifier",
     ) -> None:
         """Advances task to VERIFYING, then VERIFIED and AWAITING_APPROVAL, and asks human for approval."""
-        task = self.tasks[task_id]
-        task.transition(TaskStatus.VERIFYING, actor=actor)
+        task = self.tasks.get(task_id)
+        if task and task.status == TaskStatus.FIX_PROPOSED:
+            task.transition(TaskStatus.VERIFYING, actor=actor)
+            if not verified:
+                task.transition(TaskStatus.FAILED, actor=actor)
+            else:
+                task.transition(TaskStatus.VERIFIED, actor=actor)
+                task.transition(TaskStatus.AWAITING_APPROVAL, actor=actor)
+                task.evidence.append(evidence_text)
+
         if not verified:
-            task.transition(TaskStatus.FAILED, actor=actor)
             self.client.send_message(
                 room_id,
                 f"❌ Task `{task_id}` verification failed. Tests did not pass.",
@@ -236,12 +299,8 @@ class RepoRescueDispatcher:
             )
             return
 
-        task.transition(TaskStatus.VERIFIED, actor=actor)
-        task.transition(TaskStatus.AWAITING_APPROVAL, actor=actor)
-        task.evidence.append(evidence_text)
-
         card = WorkflowFormatter.format_verification_card(
-            task.task_id, passed_count, failed_count, duration_s, verified=True
+            task_id, passed_count, failed_count, duration_s, verified=True
         )
         self.client.send_message(
             room_id, card, metadata={"task_id": task_id, "status": "awaiting_approval"}

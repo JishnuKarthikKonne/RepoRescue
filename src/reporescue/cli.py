@@ -5,6 +5,7 @@ import logging
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -12,7 +13,11 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
+from .agent_runtime import AgentRuntimeFactory
+from .demo import init_demo_repository
+from .git_ops import WorktreeManager
 from .models import BugTask
+from .orchestrator import WorkflowOrchestrator
 from .switch.client import MockSwitchClient, SwitchClient, SwitchConfig
 from .switch.dispatcher import RepoRescueDispatcher
 from .switch.listener import SwitchListener
@@ -31,12 +36,23 @@ def run_listener(
     demo: bool = False,
     room_id: str | None = None,
     poll_interval: float = 2.0,
+    repo_path: Path | str | None = None,
 ) -> None:
     """Runs the RepoRescue Switch listener in either live or mock mode."""
     cfg = SwitchConfig.from_env()
     target_room = room_id or cfg.default_room_id or "!reporescue:localhost"
 
-    if mock:
+    # Setup demo repository if requested
+    if demo:
+        demo_dir = Path(".reporescue") / "demo_repo"
+        logger.info("Initializing isolated demo repository at %s", demo_dir)
+        working_repo = init_demo_repository(demo_dir)
+    else:
+        working_repo = Path(repo_path).resolve() if repo_path else Path.cwd()
+
+    runtime = AgentRuntimeFactory.get_runtime("mock" if mock or demo else None)
+
+    if mock or demo:
         logger.info("Initializing RepoRescue in MOCK mode (offline demonstration)")
         client = MockSwitchClient(cfg)
     else:
@@ -48,6 +64,16 @@ def run_listener(
         client = SwitchClient(cfg)
 
     dispatcher = RepoRescueDispatcher(client)
+    worktree_mgr = WorktreeManager(working_repo)
+    orchestrator = WorkflowOrchestrator(
+        repo_path=working_repo,
+        runtime=runtime,
+        worktree_mgr=worktree_mgr,
+        dispatcher=dispatcher,
+        room_id=target_room,
+    )
+    dispatcher.orchestrator = orchestrator
+
     listener = SwitchListener(
         client,
         dispatcher,
@@ -65,9 +91,10 @@ def run_listener(
         signal.signal(signal.SIGTERM, _sig_handler)
 
     if mock and demo:
-        # Simulate an incoming bug report in mock demo mode
-        logger.info("Injecting simulated bug report into mock room...")
-        mock_client = client  # type: ignore[assignment]
+        logger.info("=== STARTING AUTONOMOUS WORKFLOW DEMO ===")
+        mock_client: MockSwitchClient = client  # type: ignore[assignment]
+
+        # 1. Inject simulated bug report
         mock_client.queue_event(
             SwitchMessageEvent.from_agent_event(
                 {
@@ -75,8 +102,8 @@ def run_listener(
                     "room_id": target_room,
                     "payload": {
                         "message_id": "demo_msg_001",
-                        "sender": "@developer:localhost",
-                        "sender_name": "Developer Alex",
+                        "sender": "@alex:localhost",
+                        "sender_name": "Alex (Developer)",
                         "sender_kind": "user",
                         "body": "Bug: Checkout returns HTTP 500 when coupon is applied\nSteps to reproduce: POST /checkout with code='EXPIRED'",
                         "timestamp": int(time.time() * 1000),
@@ -85,7 +112,41 @@ def run_listener(
             )
         )
 
-    # Run listener loop
+        # Process the bug report and run multi-agent workflow
+        listener.poll_once()
+
+        # Display cards broadcast to the room
+        print("\n" + "=" * 60)
+        print("  MESSAGES POSTED TO SWITCH ROOM (#reporescue)")
+        print("=" * 60)
+        for room, content, meta in mock_client.sent_messages:
+            print(f"\n[Room: {room}]\n{content}\n" + "-" * 40)
+
+        # 2. Simulate human approval in the room
+        logger.info("Simulating verified human approval '/approve' in the room...")
+        mock_client.queue_event(
+            SwitchMessageEvent.from_agent_event(
+                {
+                    "type": "message",
+                    "room_id": target_room,
+                    "payload": {
+                        "message_id": "demo_msg_002",
+                        "sender": "@alex:localhost",
+                        "sender_name": "Alex (Developer)",
+                        "sender_kind": "user",
+                        "body": "/approve",
+                        "timestamp": int(time.time() * 1000),
+                    },
+                }
+            )
+        )
+        listener.poll_once()
+
+        print(f"\n[Final Message to Room]:\n{mock_client.last_message_content}\n")
+        logger.info("=== DEMO WORKFLOW COMPLETED SUCCESSFULLY ===")
+        return
+
+    # Run continuous listener loop for live execution
     logger.info("RepoRescue is listening for bug reports in room '%s'...", target_room)
     try:
         listener.run_loop()
@@ -106,7 +167,9 @@ def main() -> None:
         help="Use mock Switch client for offline testing and demos",
     )
     parser.add_argument(
-        "--demo", action="store_true", help="Inject a sample bug report in mock mode"
+        "--demo",
+        action="store_true",
+        help="Run self-contained autonomous multi-agent demo",
     )
     parser.add_argument(
         "--room-id",
@@ -118,8 +181,12 @@ def main() -> None:
         default=2.0,
         help="Seconds between polls (default: 2.0s)",
     )
+    parser.add_argument(
+        "--repo-path",
+        help="Target repository to work on (defaults to current directory)",
+    )
 
-    # Preserve standalone CLI creation options
+    # Standalone CLI task creation options
     parser.add_argument(
         "--title", default="Checkout returns HTTP 500", help="Task title"
     )
@@ -138,6 +205,7 @@ def main() -> None:
             demo=args.demo,
             room_id=args.room_id,
             poll_interval=args.poll_interval,
+            repo_path=args.repo_path,
         )
     else:
         # Standalone task creation mode (preserves original behavior)

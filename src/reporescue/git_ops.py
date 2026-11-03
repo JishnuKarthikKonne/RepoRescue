@@ -84,6 +84,26 @@ class WorktreeManager:
 
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
 
+        # Ensure repo-local exclude file ignores worktree dir if located inside repository
+        if self.worktrees_dir.is_relative_to(self.repo_path):
+            try:
+                exclude_file = self.repo_path / ".git" / "info" / "exclude"
+                if exclude_file.exists():
+                    exclude_content = exclude_file.read_text(encoding="utf-8")
+                    rel_root = (
+                        self.worktrees_dir.relative_to(self.repo_path)
+                        .as_posix()
+                        .split("/")[0]
+                        + "/"
+                    )
+                    if rel_root not in exclude_content:
+                        exclude_file.write_text(
+                            exclude_content.rstrip() + f"\n{rel_root}\n",
+                            encoding="utf-8",
+                        )
+            except OSError:
+                pass
+
     def _run_git(self, args: Sequence[str], *, cwd: Path | None = None) -> str:
         """Executes a git command using run_command, checking for errors."""
         working_dir = cwd or self.repo_path
