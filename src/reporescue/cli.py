@@ -21,6 +21,9 @@ if hasattr(sys.stderr, "reconfigure"):
 from .agent_runtime import AgentRuntimeFactory, RuntimeConfigurationError
 from .demo import init_demo_repository
 from .git_ops import WorktreeManager
+from .github.client import GitHubClient, MockGitHubClient
+from .github.config import GitHubConfig
+from .github.manager import GitHubPRManager
 from .models import BugTask, TaskStatus
 from .orchestrator import WorkflowOrchestrator
 from .switch.client import MockSwitchClient, SwitchClient, SwitchConfig, SwitchError
@@ -108,6 +111,20 @@ def run_listener(
         room_id=target_room,
     )
     dispatcher.orchestrator = orchestrator
+
+    # Attach GitHub PR Manager
+    gh_cfg = GitHubConfig.from_env(working_repo)
+    if mock or demo or gh_cfg.dry_run:
+        if not gh_cfg.repository:
+            gh_cfg.repository = "switch-hackathon/RepoRescue"
+        gh_cfg.dry_run = True
+        gh_client = MockGitHubClient(gh_cfg)
+        gh_mgr = GitHubPRManager(gh_cfg, client=gh_client, worktree_mgr=worktree_mgr)
+        orchestrator.github_manager = gh_mgr
+    elif gh_cfg.is_configured:
+        gh_client = GitHubClient(gh_cfg)
+        gh_mgr = GitHubPRManager(gh_cfg, client=gh_client, worktree_mgr=worktree_mgr)
+        orchestrator.github_manager = gh_mgr
 
     listener = SwitchListener(
         client,
@@ -383,6 +400,17 @@ def run_live_demo(
     )
     dispatcher.orchestrator = orchestrator
 
+    gh_cfg = GitHubConfig.from_env(working_repo)
+    if gh_cfg.is_configured and not gh_cfg.dry_run:
+        gh_client = GitHubClient(gh_cfg)
+    else:
+        if not gh_cfg.repository:
+            gh_cfg.repository = "switch-hackathon/RepoRescue"
+        gh_cfg.dry_run = True
+        gh_client = MockGitHubClient(gh_cfg)
+    gh_mgr = GitHubPRManager(gh_cfg, client=gh_client, worktree_mgr=worktree_mgr)
+    orchestrator.github_manager = gh_mgr
+
     listener = SwitchListener(
         client,
         dispatcher,
@@ -470,6 +498,66 @@ def run_live_demo(
     print("=" * 70)
 
 
+def run_github_check(repo_path: Path | str | None = None) -> None:
+    """Diagnoses and validates GitHub PR publishing configuration and access."""
+    print("=" * 70)
+    print("  REPORESCUE: GITHUB INTEGRATION DIAGNOSTIC CHECK")
+    print("=" * 70)
+
+    working_repo = Path(repo_path).resolve() if repo_path else Path.cwd()
+    cfg = GitHubConfig.from_env(working_repo)
+
+    print(f"\nTarget Repository:    {cfg.repository or '<not configured>'}")
+    print(f"Base Branch:          {cfg.base_branch}")
+    print(f"API Endpoint:         {cfg.api_url}")
+    print(f"Draft Enforcement:    {cfg.draft} (Strictly enforced)")
+    print(f"Dry Run Mode:         {cfg.dry_run}")
+    print(f"Repository Allowlist: {cfg.repository_allowlist or '<none>'}")
+    print(f"Token Configuration:  {cfg.masked_token}")
+
+    errors = cfg.validate()
+    if errors:
+        print("\n[Configuration Issues]:")
+        for err in errors:
+            print(f"  ✗ {err}")
+        print("\nReadiness: 🛑 NOT READY for live GitHub publishing.")
+        print(
+            "Note: Set GITHUB_TOKEN and GITHUB_REPOSITORY (or configure git remote origin)."
+        )
+        print(
+            "      Deterministic mock publishing is available offline via --mock or GITHUB_DRY_RUN=1."
+        )
+        return
+
+    # If configured with a token, perform live check
+    if cfg.token:
+        print("\n[Validating Authentication & Repository Access with GitHub API...]")
+        client = GitHubClient(cfg)
+        try:
+            repo_info = client.check_auth_and_repo()
+            full_name = repo_info.get("full_name", cfg.repository)
+            default_branch = repo_info.get("default_branch", "main")
+            permissions = repo_info.get("permissions", {})
+            can_push = permissions.get("push", False)
+            can_pull = permissions.get("pull", False)
+
+            print(f"  ✓ Connected to repository: {full_name}")
+            print(f"  ✓ Default branch: {default_branch}")
+            print(f"  ✓ Permissions: push={can_push}, pull={can_pull}")
+
+            if not can_push:
+                print(
+                    "  ⚠️ Warning: Token does not appear to have 'push' permission on this repository."
+                )
+            else:
+                print("\nReadiness: ✅ READY for secure Draft PR publishing.")
+        except Exception as err:  # noqa: BLE001
+            print(f"  ✗ API Validation Failed: {err}")
+            print("\nReadiness: 🛑 NOT READY (API check failed).")
+    else:
+        print("\nReadiness: ⚠️ DRY RUN ONLY (No live token configured).")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="RepoRescue: Human-approved collaborative AI bug-fixing workflow"
@@ -481,6 +569,11 @@ def main() -> None:
         "--live-demo",
         action="store_true",
         help="Run end-to-end autonomous workflow against live Switch Core",
+    )
+    parser.add_argument(
+        "--github-check",
+        action="store_true",
+        help="Diagnose and validate GitHub PR publishing configuration and access",
     )
     parser.add_argument(
         "--mock",
@@ -533,7 +626,9 @@ def main() -> None:
 
     runtime_mode = "real" if args.real else args.runtime
 
-    if args.live_demo:
+    if args.github_check:
+        run_github_check(repo_path=args.repo_path)
+    elif args.live_demo:
         run_live_demo(
             runtime_mode=runtime_mode,
             repo_path=args.repo_path,

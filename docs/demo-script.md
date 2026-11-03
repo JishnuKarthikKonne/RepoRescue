@@ -79,22 +79,29 @@ This script provides an exact, step-by-step walkthrough for demonstrating RepoRe
     - Tests failed: 0
     - Verification: `COMPLETE ✅`
 
-### 2:15 - 3:00 | Human Approval Gate (Zero Auto-Deploy)
+### 2:15 - 3:00 | Human Approval Gate & Secure GitHub Draft PR
 - **RepoRescue Message**:
   > `[IMPORTANT] Human Approval Required`
   > `Reply: /approve or /reject <reason>`
 - **Safety Enforcement**:
   - Bot approvals are rejected by identity verification rules.
-  - No code is merged or pushed without human sign-off.
+  - Patch fingerprint (`sha256:...`) cryptographically seals worktree diff.
 - **Action**: Lead Developer replies:
   > `/approve`
-- **Final Card**:
-  > `👤 Human Approval Granted`
-  > `Approved By: @lead_dev at 2026-11-03T...`
-  > `Next Step: Ready to open Pull Request with full reproduction and verification evidence.`
-- **Presenter**: "The fix is verified, the main branch was never touched, and human engineers retain total governance. That is RepoRescue."
+- **RepoRescue Safety Validation**:
+  - Validates all 10 Strict Safety Gates (A-J).
+  - Pushes dedicated branch `reporescue/task-xxxxxx` (no force push).
+  - Creates a GitHub **DRAFT** Pull Request (`draft=True`).
+- **Final Card in Switch Room**:
+  > `🚀 RepoRescue | Draft Pull Request Created`
+  > `Draft PR: #1 (https://github.com/switch-hackathon/RepoRescue/pull/1)`
+  > `Branch: reporescue/task-xxxxxx`
+  > `State: DRAFT (Awaiting human code review)`
+  > `Approved By: @lead_dev`
+  > `Zero Auto-Merge / Zero Auto-Deploy Guarantee: This PR was created in DRAFT mode and cannot be merged automatically.`
+- **Presenter**: "The fix is reproduced, surgically patched, independently verified with pytest, human-approved in Switch, and published as a GitHub Draft PR without ever modifying main or risking auto-deployments. That is RepoRescue."
 
 ---
 
 ## Offline Fallback Notice
-When live Switch servers or external AI API keys are unavailable, `--mock --demo` provides a 100% deterministic, offline execution with genuine subprocess pytest runs and real Git worktree operations.
+When live Switch servers or external AI API keys are unavailable, `--mock --demo` provides a 100% deterministic, offline execution with genuine subprocess pytest runs, real Git worktree operations, and offline mock Draft PR creation.

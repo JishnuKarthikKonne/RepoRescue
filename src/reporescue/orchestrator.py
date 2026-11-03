@@ -11,6 +11,7 @@ from .agent_runtime import (
     load_agent_prompt,
 )
 from .git_ops import WorktreeInfo, WorktreeManager
+from .github.fingerprint import compute_worktree_patch_fingerprint
 from .models import BugTask, TaskStatus
 from .runner import run_command, run_pytest
 from .schemas import (
@@ -155,12 +156,14 @@ class WorkflowOrchestrator:
         worktree_mgr: WorktreeManager | None = None,
         dispatcher: RepoRescueDispatcher | None = None,
         room_id: str | None = None,
+        github_manager: Any | None = None,
     ) -> None:
         self.repo_path = Path(repo_path).resolve()
         self.runtime = runtime
         self.worktree_mgr = worktree_mgr or WorktreeManager(self.repo_path)
         self.dispatcher = dispatcher
         self.room_id = room_id
+        self.github_manager = github_manager
 
         self.stage_results: dict[str, dict[WorkflowStage, StageExecutionResult]] = {}
         self.active_worktrees: dict[str, WorktreeInfo] = {}  # task_id -> WorktreeInfo
@@ -429,6 +432,11 @@ class WorkflowOrchestrator:
                 cwd=wt.path,
             )
 
+        # Compute initial patch fingerprint & commit hash
+        fp, _, commit_sha = compute_worktree_patch_fingerprint(wt.path)
+        task.verified_patch_fingerprint = fp
+        task.commit_sha = commit_sha
+
         fix_res = FixResult(
             changed_files=changed_files,
             diff=real_diff,
@@ -513,11 +521,17 @@ class WorkflowOrchestrator:
                 f"Verification failed on branch {wt.branch}: exit={test_run.exit_code}"
             )
 
+        # Bind verified cryptographic patch fingerprint and commit hash to task
+        fp, _, commit_sha = compute_worktree_patch_fingerprint(wt.path)
+        task.verified_patch_fingerprint = fp
+        task.commit_sha = commit_sha
+
         task.transition(TaskStatus.VERIFIED, actor="verifier")
         task.transition(TaskStatus.AWAITING_APPROVAL, actor="verifier")
         task.evidence.append(
             f"Verification PASSED: {passed_count} passed in {test_run.duration_seconds:.2f}s"
         )
+        task.evidence.append(f"Verified Patch Fingerprint: {fp}")
 
         if self.dispatcher and target_room:
             self.dispatcher.publish_verification(
@@ -534,10 +548,48 @@ class WorkflowOrchestrator:
             task.task_id,
             WorkflowStage.VERIFICATION,
             verif_res,
-            [verif_res.test_logs],
+            [verif_res.test_logs, f"Fingerprint: {fp}"],
             "local-test-runner",
         )
         return verif_res
+
+    def is_github_configured(self) -> bool:
+        """Returns True if GitHub PR publishing is configured."""
+        if self.github_manager is not None:
+            return getattr(self.github_manager.config, "is_configured", False)
+        try:
+            from .github.config import GitHubConfig
+
+            return GitHubConfig.from_env(self.repo_path).is_configured
+        except Exception:  # noqa: BLE001
+            return False
+
+    def publish_draft_pr(self, task: BugTask) -> Any:
+        """Publishes the approved bug fix as a GitHub DRAFT Pull Request."""
+        if not self.github_manager:
+            from .github.manager import GitHubPRManager
+
+            self.github_manager = GitHubPRManager(worktree_mgr=self.worktree_mgr)
+
+        wt = self._get_task_worktree(task)
+        runtime_name = getattr(self.runtime, "runtime_name", "mock")
+        stage_res = self.stage_results.get(task.task_id, {})
+
+        pr_result = self.github_manager.publish_draft_pr(
+            task,
+            wt.path,
+            stage_results=stage_res,
+            runtime_name=runtime_name,
+        )
+
+        self._record_stage(
+            task.task_id,
+            WorkflowStage.PULL_REQUEST,
+            pr_result,
+            [pr_result.html_url, f"PR #{pr_result.pr_number}"],
+            "github-client",
+        )
+        return pr_result
 
     def execute_full_workflow(self, task: BugTask) -> VerificationResult:
         """Runs the complete multi-agent pipeline sequentially up to human approval gate."""

@@ -54,8 +54,11 @@ flowchart LR
     Reproducer --> Fixer["4. Fixer"]
     Fixer --> Verifier["5. Verifier"]
     Verifier --> ApprovalGate{"6. Human Approval Gate"}
-    ApprovalGate -->|/approve| Approved["Ready for PR"]
-    ApprovalGate -->|/reject| Rejected["Task Rejected"]
+    ApprovalGate -->|/approve (Verified Human)| Approved["Task APPROVED"]
+    ApprovalGate -->|/reject (Human)| Rejected["Task REJECTED"]
+    Approved --> SafetyGates{"10 Safety Gates Check"}
+    SafetyGates -->|Gates Passed| DraftPR["7. GitHub Draft PR (draft=True)"]
+    SafetyGates -->|Tamper Detected| Invalidated["Approval Invalidated"]
 ```
 
 ### Stage Responsibilities & Artifacts
@@ -67,7 +70,8 @@ flowchart LR
 | **Reproducer** | Investigation, isolated worktree | Generates minimal reproducer test file (`test_reproduce_*.py`), runs pytest | `ReproductionResult` (failing test exit code 1, test output) |
 | **Fixer** | Root cause, reproduction test, worktree branch | Implements minimal surgical fix in isolated branch, runs `git diff` | `FixResult` (patch diff, files changed, rationale) |
 | **Verifier** | Patched worktree, full test suite | Executes pytest via safe test runner, validates 0 failures | `VerificationResult` (passed count, failed count, exit code 0) |
-| **Approval Gate**| Verification evidence, diff card | Pauses in `AWAITING_APPROVAL`. Enforces verified human identity | `TaskStatus.RESOLVED` or `TaskStatus.REJECTED` |
+| **Approval Gate**| Verification evidence, diff card | Pauses in `AWAITING_APPROVAL`. Enforces verified human identity and patch binding | `TaskStatus.APPROVED` or `TaskStatus.REJECTED` |
+| **Pull Request** | Approved task, verified worktree branch | Validates 10 Safety Gates, pushes dedicated branch, opens DRAFT PR | `TaskStatus.PR_CREATED` (Draft PR URL, PR card) |
 
 ---
 
@@ -105,4 +109,27 @@ Switch serves as the central communication surface between human developers and 
   - Approvals (`/approve`) from senders with `sender_kind == "agent"`, `sender_kind == "bot"`, or bot-like identifiers are rejected.
   - Only verified human senders can advance a task past `AWAITING_APPROVAL`.
   - The approver's handle and an ISO UTC timestamp are immutably stored in the task record.
-- **Zero Auto-Merge / Auto-Deploy**: RepoRescue halts upon verification and human approval. Pull request creation, merging, and deployment remain exclusively under human control.
+- **Zero Auto-Merge / Auto-Deploy**: Pull request creation, merging, and deployment remain strictly under human control.
+
+---
+
+## 6. Secure GitHub Draft Pull Request Integration (`github/`)
+
+Following human approval in Switch, RepoRescue safely packages the verified fix into a GitHub Draft Pull Request:
+
+1. **Strictly Draft Mode**: All PRs are created with `draft: True`. They cannot be merged until human maintainers inspect and mark them ready on GitHub.
+2. **Cryptographic SHA-256 Patch Binding**: Human approval cryptographically seals the verified git diff. Modifying worktree files post-approval triggers tamper detection, immediately revoking approval and transitioning the task back to `fix_proposed`.
+3. **The 10 Strict Safety Gates (A-J)**: Must pass prior to any Git push or PR creation:
+   - *Gate A*: Task status is `approved`.
+   - *Gate B*: Approver is a verified human (not an agent/bot).
+   - *Gate C*: Real verified patch record exists.
+   - *Gate D*: Independent verification test suite succeeded (exit code 0).
+   - *Gate E*: Current worktree diff matches approved cryptographic SHA-256 fingerprint.
+   - *Gate F*: Branch strictly matches dedicated `reporescue/task-<task-id>` format.
+   - *Gate G*: No forbidden paths or secrets in diff or commits.
+   - *Gate H*: Target repository matches configured target and repository allowlist.
+   - *Gate I*: Worktree is completely clean with zero uncommitted changes.
+   - *Gate J*: Remote repository and base branch are reachable.
+4. **Complete Audit Trail**: Pull Request body includes full investigation evidence, reproduction logs, surgical patch diff, verification test duration, human approver identity, and patch fingerprint.
+5. **No Force Pushes**: Pushes use `git push -u origin <branch>` without `--force` to protect remote Git history.
+6. **Detailed Documentation**: See [docs/github-integration.md](github-integration.md) for full token permissions, environment variables, and protocol specifications.

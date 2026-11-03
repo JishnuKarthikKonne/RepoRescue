@@ -16,6 +16,7 @@ class TaskStatus(StrEnum):
     VERIFIED = "verified"
     AWAITING_APPROVAL = "awaiting_approval"
     APPROVED = "approved"
+    PR_CREATED = "pr_created"
     REJECTED = "rejected"
     FAILED = "failed"
 
@@ -32,6 +33,12 @@ class BugTask:
     proposed_branch: str | None = None
     approval_by: str | None = None
     approved_at: datetime | None = None
+    verified_patch_fingerprint: str | None = None
+    approved_patch_fingerprint: str | None = None
+    commit_sha: str | None = None
+    pr_url: str | None = None
+    pr_number: int | None = None
+    pr_created_at: datetime | None = None
 
     def transition(
         self, new_status: TaskStatus, *, actor: str, timestamp: datetime | None = None
@@ -51,6 +58,12 @@ class BugTask:
             TaskStatus.VERIFYING: {TaskStatus.VERIFIED, TaskStatus.FAILED},
             TaskStatus.VERIFIED: {TaskStatus.AWAITING_APPROVAL},
             TaskStatus.AWAITING_APPROVAL: {TaskStatus.APPROVED, TaskStatus.REJECTED},
+            TaskStatus.APPROVED: {
+                TaskStatus.PR_CREATED,
+                TaskStatus.FIX_PROPOSED,
+                TaskStatus.FAILED,
+            },
+            TaskStatus.PR_CREATED: {TaskStatus.FAILED},
             TaskStatus.REJECTED: {TaskStatus.FIX_PROPOSED},
         }
         if new_status not in allowed.get(self.status, set()):
@@ -61,3 +74,5 @@ class BugTask:
                 raise ValueError("Approval actor must be named")
             self.approval_by = actor
             self.approved_at = timestamp or datetime.now(UTC)
+        elif new_status == TaskStatus.PR_CREATED:
+            self.pr_created_at = timestamp or datetime.now(UTC)

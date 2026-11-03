@@ -59,6 +59,10 @@ class RepoRescueDispatcher:
         if re.match(r"^/reject(\s+.*)?$", body, re.IGNORECASE):
             return self._handle_rejection(event)
 
+        # 5. Check for PR publishing commands: /publish-pr [task_id] or /create-pr [task_id]
+        if re.match(r"^/(publish-pr|create-pr)(\s+[\w\-]+)?$", body, re.IGNORECASE):
+            return self._handle_publish_pr(event)
+
         # 5. Non-human messages (automated bots or agents) must NOT trigger new bug tasks
         if not event.is_human_sender:
             return None
@@ -144,6 +148,30 @@ class RepoRescueDispatcher:
             )
             return task
 
+        # Section 6: Cryptographically bind human approval to exact patch contents
+        if self.orchestrator and hasattr(self.orchestrator, "_get_task_worktree"):
+            try:
+                from ..github.fingerprint import compute_worktree_patch_fingerprint
+
+                wt = self.orchestrator._get_task_worktree(task)
+                current_fp, _, commit_sha = compute_worktree_patch_fingerprint(wt.path)
+                verified_fp = getattr(task, "verified_patch_fingerprint", None)
+                if verified_fp and current_fp != verified_fp:
+                    warn_msg = (
+                        f"🛑 Approval aborted: Worktree patch was modified after verification "
+                        f"(expected {verified_fp}, found {current_fp}). Re-verification required."
+                    )
+                    self.client.send_message(event.room_id, warn_msg)
+                    return task
+                task.approved_patch_fingerprint = current_fp
+                task.commit_sha = commit_sha
+            except Exception as err:  # noqa: BLE001
+                import logging
+
+                logging.getLogger("reporescue.dispatcher").debug(
+                    "Patch fingerprint verification skipped: %s", err
+                )
+
         # Enforce human actor and timestamp in state machine
         task.transition(
             TaskStatus.APPROVED, actor=event.sender_name, timestamp=event.timestamp
@@ -154,6 +182,115 @@ class RepoRescueDispatcher:
         self.client.send_message(
             event.room_id, confirm_card, metadata={"task_id": task.task_id}
         )
+
+        # Attempt GitHub Draft PR creation if orchestrator and GitHub are configured
+        if self.orchestrator and hasattr(self.orchestrator, "publish_draft_pr"):
+            is_configured = getattr(
+                self.orchestrator,
+                "is_github_configured",
+                lambda: getattr(self.orchestrator, "github_manager", None) is not None,
+            )()
+            if is_configured:
+                try:
+                    pr_result = self.orchestrator.publish_draft_pr(task)
+                    pr_card = WorkflowFormatter.format_draft_pr_card(
+                        task.task_id,
+                        pr_result.html_url,
+                        pr_result.pr_number,
+                        pr_result.branch_name,
+                        pr_result.commit_sha,
+                        task.approval_by or event.sender_name,
+                        pr_result.patch_fingerprint,
+                        is_existing=pr_result.is_existing,
+                    )
+                    self.client.send_message(
+                        event.room_id,
+                        pr_card,
+                        metadata={
+                            "task_id": task.task_id,
+                            "pr_url": pr_result.html_url,
+                        },
+                    )
+                except Exception as err:  # noqa: BLE001
+                    import logging
+
+                    logging.getLogger("reporescue.dispatcher").warning(
+                        "GitHub draft PR publishing failed on approval: %s", err
+                    )
+                    fail_card = WorkflowFormatter.format_pr_failure_card(
+                        task.task_id, str(err)
+                    )
+                    self.client.send_message(
+                        event.room_id,
+                        fail_card,
+                        metadata={"task_id": task.task_id, "status": "pr_failed"},
+                    )
+
+        return task
+
+    def _handle_publish_pr(self, event: SwitchMessageEvent) -> BugTask | None:
+        """Handles human /publish-pr or /create-pr command in the Switch room."""
+        if not event.is_human_sender:
+            warn_msg = (
+                f"⚠️ Command ignored: Pull Request creation must be initiated by a verified human teammate "
+                f"(received from '@{event.sender_name}')."
+            )
+            self.client.send_message(event.room_id, warn_msg)
+            return None
+
+        task_id = self._resolve_target_task_id(event)
+        if not task_id or task_id not in self.tasks:
+            self.client.send_message(
+                event.room_id,
+                "⚠️ No active task found for PR publication.",
+            )
+            return None
+
+        task = self.tasks[task_id]
+        if task.status not in (TaskStatus.APPROVED, TaskStatus.PR_CREATED):
+            self.client.send_message(
+                event.room_id,
+                f"⚠️ Cannot publish PR: Task `{task.task_id}` is in state `{task.status}`. "
+                f"Task must be `{TaskStatus.APPROVED}` by a human before opening a Draft PR.",
+            )
+            return task
+
+        if not self.orchestrator or not hasattr(self.orchestrator, "publish_draft_pr"):
+            self.client.send_message(
+                event.room_id,
+                "⚠️ GitHub publishing is not configured in this session.",
+            )
+            return task
+
+        try:
+            pr_result = self.orchestrator.publish_draft_pr(task)
+            pr_card = WorkflowFormatter.format_draft_pr_card(
+                task.task_id,
+                pr_result.html_url,
+                pr_result.pr_number,
+                pr_result.branch_name,
+                pr_result.commit_sha,
+                task.approval_by or event.sender_name,
+                pr_result.patch_fingerprint,
+                is_existing=pr_result.is_existing,
+            )
+            self.client.send_message(
+                event.room_id,
+                pr_card,
+                metadata={"task_id": task.task_id, "pr_url": pr_result.html_url},
+            )
+        except Exception as err:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("reporescue.dispatcher").warning(
+                "GitHub draft PR publishing failed on /publish-pr: %s", err
+            )
+            fail_card = WorkflowFormatter.format_pr_failure_card(task.task_id, str(err))
+            self.client.send_message(
+                event.room_id,
+                fail_card,
+                metadata={"task_id": task.task_id, "status": "pr_failed"},
+            )
         return task
 
     def _handle_rejection(self, event: SwitchMessageEvent) -> BugTask | None:

@@ -1,0 +1,178 @@
+from __future__ import annotations
+
+import json
+import urllib.error
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from reporescue.github.client import (
+    GitHubAuthError,
+    GitHubClient,
+    GitHubNotFoundError,
+    GitHubRateLimitError,
+    GitHubValidationError,
+    MockGitHubClient,
+)
+from reporescue.github.config import GitHubConfig
+from reporescue.github.models import GitHubPRRequest
+
+
+def test_github_client_create_draft_pr_success():
+    cfg = GitHubConfig(
+        token="ghp_test_secret_token_123",
+        repository="owner/repo",
+        base_branch="main",
+    )
+    client = GitHubClient(cfg)
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(
+        {
+            "id": 101,
+            "number": 42,
+            "url": "https://api.github.com/repos/owner/repo/pulls/42",
+            "html_url": "https://github.com/owner/repo/pull/42",
+            "title": "[RepoRescue] Fix checkout bug",
+            "draft": True,
+            "head": {"sha": "abc1234567890"},
+            "created_at": "2026-11-03T12:00:00Z",
+        }
+    ).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
+        req = GitHubPRRequest(
+            task_id="task-123",
+            title="[RepoRescue] Fix checkout bug",
+            body="### Summary\nFix applied.",
+            head_branch="reporescue/task-123",
+            base_branch="main",
+            draft=True,
+        )
+        res = client.create_draft_pr(req)
+
+        assert res.pr_number == 42
+        assert res.html_url == "https://github.com/owner/repo/pull/42"
+        assert res.draft is True
+        assert res.is_existing is False
+
+        # Inspect request
+        http_req = mock_urlopen.call_args[0][0]
+        assert (
+            http_req.get_full_url() == "https://api.github.com/repos/owner/repo/pulls"
+        )
+        assert http_req.headers["Authorization"] == "Bearer ghp_test_secret_token_123"
+        assert http_req.headers["Accept"] == "application/vnd.github+json"
+
+        sent_body = json.loads(http_req.data.decode("utf-8"))
+        assert sent_body["draft"] is True
+        assert sent_body["head"] == "reporescue/task-123"
+
+
+def test_github_client_auth_failure_masks_token():
+    secret_token = "ghp_ultra_secret_credentials_999"
+    cfg = GitHubConfig(token=secret_token, repository="owner/repo")
+    client = GitHubClient(cfg)
+
+    http_error = urllib.error.HTTPError(
+        url="https://api.github.com/repos/owner/repo/pulls",
+        code=401,
+        msg="Unauthorized",
+        hdrs={},
+        fp=MagicMock(read=lambda: f"Bad credentials for token {secret_token}".encode()),
+    )
+
+    with patch("urllib.request.urlopen", side_effect=http_error):
+        req = GitHubPRRequest(
+            task_id="task-123",
+            title="Title",
+            body="Body",
+            head_branch="head",
+        )
+        with pytest.raises(GitHubAuthError) as exc_info:
+            client.create_draft_pr(req)
+
+        err_text = str(exc_info.value)
+        assert secret_token not in err_text
+        assert "***" in err_text
+
+
+def test_github_client_not_found():
+    cfg = GitHubConfig(token="token", repository="owner/missing-repo")
+    client = GitHubClient(cfg)
+
+    http_error = urllib.error.HTTPError(
+        url="https://api.github.com/repos/owner/missing-repo/pulls",
+        code=404,
+        msg="Not Found",
+        hdrs={},
+        fp=MagicMock(read=lambda: b'{"message": "Not Found"}'),
+    )
+
+    with patch("urllib.request.urlopen", side_effect=http_error):
+        req = GitHubPRRequest(task_id="t1", title="T", body="B", head_branch="h")
+        with pytest.raises(GitHubNotFoundError):
+            client.create_draft_pr(req)
+
+
+def test_github_client_rate_limit():
+    cfg = GitHubConfig(token="token", repository="owner/repo")
+    client = GitHubClient(cfg)
+
+    mock_hdrs = MagicMock()
+    mock_hdrs.get.return_value = "0"  # x-ratelimit-remaining == 0
+
+    http_error = urllib.error.HTTPError(
+        url="https://api.github.com/repos/owner/repo/pulls",
+        code=403,
+        msg="Forbidden",
+        hdrs=mock_hdrs,
+        fp=MagicMock(read=lambda: b'{"message": "API rate limit exceeded"}'),
+    )
+
+    with patch("urllib.request.urlopen", side_effect=http_error):
+        req = GitHubPRRequest(task_id="t1", title="T", body="B", head_branch="h")
+        with pytest.raises(GitHubRateLimitError):
+            client.create_draft_pr(req)
+
+
+def test_mock_github_client_lifecycle():
+    client = MockGitHubClient()
+
+    # 1. Check repo
+    repo = client.check_auth_and_repo()
+    assert repo["permissions"]["push"] is True
+
+    # 2. Create PR
+    req = GitHubPRRequest(
+        task_id="task-mock",
+        title="[RepoRescue] Mock fix",
+        body="Mock body",
+        head_branch="reporescue/task-mock",
+        draft=True,
+    )
+    res = client.create_draft_pr(req)
+    assert res.pr_number == 1
+    assert "pull/1" in res.html_url
+    assert res.draft is True
+
+    # 3. Existing PR idempotency
+    existing = client.find_existing_pr("reporescue/task-mock")
+    assert existing is not None
+    assert existing.pr_number == 1
+
+    # Attempt duplicate creation returns existing PR
+    res2 = client.create_draft_pr(req)
+    assert res2.pr_number == 1
+
+    # 4. Invariant check: draft=False must be rejected
+    bad_req = GitHubPRRequest(
+        task_id="task-mock2",
+        title="Title",
+        body="Body",
+        head_branch="branch2",
+        draft=False,
+    )
+    with pytest.raises(GitHubValidationError):
+        client.create_draft_pr(bad_req)

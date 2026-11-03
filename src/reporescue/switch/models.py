@@ -233,3 +233,51 @@ class WorkflowFormatter:
             f"**Approved By:** @{approver}{ts_str}\n"
             f"**Next Step:** Ready to open Pull Request with full reproduction and verification evidence."
         )
+
+    @staticmethod
+    def format_draft_pr_card(
+        task_id: str,
+        pr_url: str,
+        pr_number: int,
+        branch: str,
+        commit_sha: str,
+        approver: str,
+        patch_fingerprint: str = "",
+        is_existing: bool = False,
+    ) -> str:
+        status_label = (
+            "Existing Draft PR Linked" if is_existing else "Draft Pull Request Created"
+        )
+        fp_line = (
+            f"- **Approved Patch Fingerprint:** `{patch_fingerprint[:24]}...`\n"
+            if patch_fingerprint
+            else ""
+        )
+        sha_str = commit_sha[:8] if commit_sha else "latest"
+        return (
+            f"### 🚀 RepoRescue | {status_label}\n\n"
+            f"**Task ID:** `{task_id}`\n"
+            f"- **Draft PR:** [#{pr_number}]({pr_url})\n"
+            f"- **Branch:** `{branch}`\n"
+            f"- **Commit:** `{sha_str}`\n"
+            f"- **State:** `DRAFT` (Awaiting human code review)\n"
+            f"{fp_line}"
+            f"- **Approved By:** @{approver}\n\n"
+            f"> [!NOTE]\n"
+            f"> **Zero Auto-Merge / Zero Auto-Deploy Guarantee:**\n"
+            f"> This PR was created in **DRAFT** mode and cannot be merged automatically.\n"
+            f"> Maintainers must inspect the diff on GitHub, run required CI checks, and manually merge when ready."
+        )
+
+    @staticmethod
+    def format_pr_failure_card(task_id: str, error_message: str) -> str:
+        return (
+            f"### ⚠️ RepoRescue | GitHub PR Publication Failed\n\n"
+            f"**Task ID:** `{task_id}`\n"
+            f"**Status:** Approval preserved (safe to retry)\n"
+            f"**Reason:** {error_message}\n\n"
+            f"> [!TIP]\n"
+            f"> The verified local patch and human approval remain completely intact.\n"
+            f"> To retry publishing the Draft PR, reply:\n"
+            f"> `/publish-pr {task_id}`"
+        )

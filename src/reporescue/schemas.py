@@ -13,6 +13,7 @@ class WorkflowStage(StrEnum):
     FIX = "fix"
     VERIFICATION = "verification"
     APPROVAL = "approval"
+    PULL_REQUEST = "pull_request"
 
 
 @dataclass(frozen=True)

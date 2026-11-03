@@ -30,6 +30,9 @@ RepoRescue embeds an autonomous multi-agent engineering workflow directly inside
          │
          ▼
  6. APPROVAL GATE ──> Pauses workflow, rejects bots, requires verified human /approve
+         │
+         ▼
+ 7. DRAFT PR      ──> Validates 10 safety gates, creates GitHub DRAFT PR (draft=True)
 ```
 
 ---
@@ -85,6 +88,12 @@ python -m reporescue.cli --listen --room-id "!reporescue:localhost"
 python -m reporescue.cli --listen --real
 ```
 
+### 5. GitHub Integration Readiness Diagnostic
+Checks local GitHub credentials, remote origin, base branch, and API connectivity:
+```powershell
+python -m reporescue.cli --github-check
+```
+
 ---
 
 ## Switch Room Setup & Configuration
@@ -137,6 +146,13 @@ python -m reporescue.cli --listen --real
   - Immutably records the human approver's identity and timestamp.
   - Rejects approval if the task is not in `awaiting_approval`.
 
+### 6. Secure GitHub Draft PR Integration (`reporescue.github`)
+- Enforces 10 Strict Safety Gates (A-J) before branch push or PR creation.
+- **DRAFT Mode Strictly Enforced**: All PRs are created as `draft: True`. No auto-merge or deployment is possible.
+- **Cryptographic Patch Fingerprinting**: Approvals are bound to an exact SHA-256 hash of the git diff; post-approval file modification invalidates approval and transitions task back to `fix_proposed`.
+- **Zero Secrets / Zero Force Pushes**: Diff and commit messages scanned for secrets; branch pushes never use `--force`.
+- **Full Switch Room Integration**: Automatic creation on `/approve` or manual trigger via `/publish-pr`.
+
 ---
 
 ## Standalone Demo Repository (`demo_repo/`)
@@ -150,6 +166,7 @@ The repository includes a standalone Python package (`demo_repo/`) containing a 
 
 ## Documentation
 
+- [GitHub Integration Guide](docs/github-integration.md): Safety gates, cryptographic fingerprinting, PAT permissions, and zero auto-merge policy.
 - [Switch Integration Guide](docs/switch-integration.md): Live Switch Core 0.31.0 protocol, endpoints, and human approval verification.
 - [Architecture Blueprint](docs/architecture.md): Detailed system diagram, stage contracts, and safety boundaries.
 - [Agent Runtime Guide](docs/agent-runtime.md): Provider protocol, prompt integration, and live LLM configuration.
