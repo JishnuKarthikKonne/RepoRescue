@@ -75,6 +75,34 @@ def get_orchestrator_repository(anchor_path: Path | str | None = None) -> str | 
     return None
 
 
+def resolve_gcm_token(
+    repo_path: Path | str | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolves (username, token) from Git Credential Manager via `git credential fill`."""
+    try:
+        from ..runner import run_command
+
+        res = run_command(
+            ["git", "credential", "fill"],
+            cwd=repo_path or Path.cwd(),
+            input="protocol=https\nhost=github.com\n\n",
+            timeout_seconds=5.0,
+        )
+        if res.passed and res.stdout.strip():
+            data: dict[str, str] = {}
+            for line in res.stdout.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    data[k.strip()] = v.strip()
+            username = data.get("username")
+            password = data.get("password")
+            if password:
+                return username, password
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None, None
+
+
 @dataclass
 class GitHubConfig:
     """Configuration for GitHub Pull Request publishing."""
@@ -89,6 +117,8 @@ class GitHubConfig:
     dry_run: bool = False
     is_demo: bool = False
     orchestrator_repository: str | None = None
+    token_source: str | None = None
+    token_username: str | None = None
 
     @classmethod
     def from_env(
@@ -107,6 +137,9 @@ class GitHubConfig:
             or os.getenv("GH_TOKEN", "").strip()
             or None
         )
+        token_source = "environment" if token else None
+        token_username: str | None = None
+
         base_branch = (
             os.getenv("GITHUB_BASE_BRANCH", "").strip()
             or os.getenv("REPORESCUE_BASE_BRANCH", "").strip()
@@ -120,6 +153,14 @@ class GitHubConfig:
             "true",
             "yes",
         )
+
+        # Fallback to local Git Credential Manager if no explicit token is in environment
+        if not token and not dry_run:
+            gcm_user, gcm_token = resolve_gcm_token(repo_path)
+            if gcm_token:
+                token = gcm_token
+                token_source = "gcm"
+                token_username = gcm_user
 
         allowlist_raw = os.getenv("GITHUB_REPO_ALLOWLIST", "").strip()
         repository_allowlist = (
@@ -165,6 +206,8 @@ class GitHubConfig:
             dry_run=dry_run,
             is_demo=demo_detected,
             orchestrator_repository=orchestrator_repo,
+            token_source=token_source,
+            token_username=token_username,
         )
 
     @property
@@ -178,10 +221,15 @@ class GitHubConfig:
         if not self.token:
             return "<none>"
         if len(self.token) <= 8:
-            return "***"
-        prefix = self.token[:4]
-        suffix = self.token[-4:]
-        return f"{prefix}...{suffix}"
+            prefix_str = "***"
+        else:
+            prefix_str = f"{self.token[:4]}...{self.token[-4:]}"
+        if self.token_source == "gcm":
+            user_lbl = f" for '{self.token_username}'" if self.token_username else ""
+            return f"{prefix_str} (Windows Git Credential Manager{user_lbl})"
+        if self.token_source == "environment":
+            return f"{prefix_str} (Explicit Token)"
+        return prefix_str
 
     def validate(self) -> list[str]:
         """Validates configuration and returns any error messages."""

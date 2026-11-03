@@ -44,6 +44,7 @@ class SwitchListener:
         self._id_history: list[str] = []
         self._consecutive_errors = 0
         self._current_delay = self.poll_interval
+        self._last_heartbeat_time = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -96,39 +97,69 @@ class SwitchListener:
         self._consecutive_errors = 0
         self._current_delay = self.poll_interval
 
-        while not self._stop_event.is_set():
+        # Report connector ONLINE and send initial heartbeat to Switch Core
+        try:
+            self.client.update_status(
+                room_id=self.room_id, presence="online", status="RepoRescue Active"
+            )
+            self.client.send_heartbeat()
+        except Exception as err:  # noqa: BLE001
+            logger.debug("Initial status update failed: %s", err)
+
+        import time
+
+        self._last_heartbeat_time = time.time()
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    self.poll_once()
+                    # On success, reset backoff delay
+                    if self._consecutive_errors > 0:
+                        logger.info("Reconnection successful. Normal polling resumed.")
+                        self._consecutive_errors = 0
+                        self._current_delay = self.poll_interval
+
+                    # Periodically refresh heartbeat every 15 seconds
+                    now = time.time()
+                    if now - self._last_heartbeat_time >= 15.0:
+                        self.client.send_heartbeat()
+                        self._last_heartbeat_time = now
+
+                except SwitchAuthError as err:
+                    self._consecutive_errors += 1
+                    logger.error(
+                        "Authentication error contacting Switch server: %s", err
+                    )
+                    self._apply_backoff()
+
+                except SwitchError as err:
+                    self._consecutive_errors += 1
+                    logger.warning(
+                        "Network error connecting to Switch (attempt %d): %s. Retrying in %.1fs...",
+                        self._consecutive_errors,
+                        err,
+                        self._current_delay,
+                    )
+                    self._apply_backoff()
+
+                except Exception:
+                    self._consecutive_errors += 1
+                    logger.exception("Unexpected error in Switch poll loop")
+                    self._apply_backoff()
+
+                # Interruptible sleep
+                self._stop_event.wait(self._current_delay)
+        finally:
             try:
-                self.poll_once()
-                # On success, reset backoff delay
-                if self._consecutive_errors > 0:
-                    logger.info("Reconnection successful. Normal polling resumed.")
-                    self._consecutive_errors = 0
-                    self._current_delay = self.poll_interval
-
-            except SwitchAuthError as err:
-                self._consecutive_errors += 1
-                logger.error("Authentication error contacting Switch server: %s", err)
-                self._apply_backoff()
-
-            except SwitchError as err:
-                self._consecutive_errors += 1
-                logger.warning(
-                    "Network error connecting to Switch (attempt %d): %s. Retrying in %.1fs...",
-                    self._consecutive_errors,
-                    err,
-                    self._current_delay,
+                self.client.update_status(
+                    room_id=self.room_id,
+                    presence="offline",
+                    status="RepoRescue Stopped",
                 )
-                self._apply_backoff()
-
-            except Exception:
-                self._consecutive_errors += 1
-                logger.exception("Unexpected error in Switch poll loop")
-                self._apply_backoff()
-
-            # Interruptible sleep
-            self._stop_event.wait(self._current_delay)
-
-        logger.info("RepoRescue Switch listener stopped gracefully.")
+            except Exception as err:  # noqa: BLE001
+                logger.debug("Shutdown status update failed: %s", err)
+            logger.info("RepoRescue Switch listener stopped gracefully.")
 
     def _apply_backoff(self) -> None:
         """Calculates exponential backoff delay capped at max_backoff."""

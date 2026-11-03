@@ -64,11 +64,35 @@ def run_listener(
     if not pref and (mock or demo):
         pref = "mock"
 
+    if pref == "real":
+        from .agent_runtime import check_ollama_alive
+
+        if (
+            not (
+                os.getenv("OPENAI_API_KEY")
+                or os.getenv("LLM_BASE_URL")
+                or os.getenv("OLLAMA_HOST")
+            )
+            and check_ollama_alive()
+        ):
+            logger.info("Detected local Ollama instance at http://127.0.0.1:11434")
+            os.environ["OLLAMA_HOST"] = "http://127.0.0.1:11434"
+
     try:
         runtime = AgentRuntimeFactory.get_runtime(pref)
     except RuntimeConfigurationError as err:
         logger.error("Configuration error initializing real AI runtime: %s", err)
         sys.exit(1)
+
+    healthy, health_msg = runtime.check_health()
+    if not healthy:
+        if pref == "real":
+            logger.error("AI runtime health check failed: %s", health_msg)
+            sys.exit(1)
+        else:
+            logger.warning("AI runtime health warning: %s", health_msg)
+    else:
+        logger.info("AI runtime health: %s", health_msg)
 
     is_sim = getattr(runtime, "is_simulation", True)
     rt_name = getattr(runtime, "runtime_name", "mock")
@@ -96,7 +120,7 @@ def run_listener(
         ):
             logger.info("Auto-registering RepoRescue agent with Switch server...")
             try:
-                agent_id, _ = client.register_agent()
+                agent_id, _ = client.register_agent(name="reporescue-agent")
                 logger.info("Successfully registered agent ID: %s", agent_id)
             except (SwitchError, urllib.error.URLError, OSError) as err:
                 logger.warning("Could not auto-register agent: %s", err)
@@ -377,8 +401,28 @@ def run_live_demo(
     print(f"  ✓ Working repository at {working_repo}")
 
     pref = runtime_mode or (
-        "real" if (os.getenv("OPENAI_API_KEY") or os.getenv("LLM_BASE_URL")) else "mock"
+        "real"
+        if (
+            os.getenv("OPENAI_API_KEY")
+            or os.getenv("LLM_BASE_URL")
+            or os.getenv("OLLAMA_HOST")
+        )
+        else "mock"
     )
+    if pref == "real":
+        from .agent_runtime import check_ollama_alive
+
+        if (
+            not (
+                os.getenv("OPENAI_API_KEY")
+                or os.getenv("LLM_BASE_URL")
+                or os.getenv("OLLAMA_HOST")
+            )
+            and check_ollama_alive()
+        ):
+            logger.info("Detected local Ollama instance at http://127.0.0.1:11434")
+            os.environ["OLLAMA_HOST"] = "http://127.0.0.1:11434"
+
     try:
         runtime = AgentRuntimeFactory.get_runtime(pref)
     except (RuntimeConfigurationError, OSError, ValueError):
@@ -788,10 +832,19 @@ def main() -> None:
             runtime_mode=runtime_mode,
             repo_path=args.repo_path,
         )
-    elif args.listen or args.mock or args.demo or args.real:
+    elif args.listen:
         run_listener(
-            mock=args.mock or (not args.listen),
-            demo=args.demo or args.real,
+            mock=args.mock,
+            demo=args.demo,
+            runtime_mode=runtime_mode,
+            room_id=args.room_id,
+            poll_interval=args.poll_interval,
+            repo_path=args.repo_path,
+        )
+    elif args.demo or args.mock or (args.real and not args.listen):
+        run_listener(
+            mock=True,
+            demo=True,
             runtime_mode=runtime_mode,
             room_id=args.room_id,
             poll_interval=args.poll_interval,

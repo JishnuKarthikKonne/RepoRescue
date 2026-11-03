@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .models import SwitchMessageEvent
+
+logger = logging.getLogger("reporescue.switch")
 
 
 class SwitchError(Exception):
@@ -235,6 +238,18 @@ class SwitchClient:
                 return agent_id, api_key
         except urllib.error.HTTPError as err:
             err_body = err.read().decode("utf-8", "replace")
+            # If 409 conflict and name is "reporescue", retry once with "reporescue-agent"
+            if err.code == 409 and name == "reporescue":
+                logger.info(
+                    "Agent name 'reporescue' has owner conflict; retrying registration with 'reporescue-agent'"
+                )
+                return self.register_agent(
+                    token=token,
+                    name="reporescue-agent",
+                    description=description,
+                    display_name=display_name,
+                    overwrite=overwrite,
+                )
             if err.code in (401, 403):
                 raise SwitchAuthError(
                     f"Agent registration failed ({err.code}): {err_body}"
@@ -246,6 +261,35 @@ class SwitchClient:
             raise SwitchError(
                 f"Failed to connect to Switch server at {url}: {err.reason}"
             ) from err
+
+    def update_status(
+        self,
+        room_id: str | None = None,
+        *,
+        presence: str = "online",
+        status: str = "RepoRescue Active",
+    ) -> dict[str, Any]:
+        """Updates agent connector status in Switch Console via POST /agents/{agent_id}/status."""
+        endpoint = f"/agents/{self.config.agent_id}/status"
+        payload = {
+            "room_id": room_id or self.config.default_room_id or "default",
+            "presence": presence,
+            "status": status,
+        }
+        try:
+            return self._make_request(endpoint, method="POST", body=payload)
+        except Exception as err:  # noqa: BLE001
+            logger.debug("Failed to update status on Switch: %s", err)
+            return {"ok": False}
+
+    def send_heartbeat(self) -> dict[str, Any]:
+        """Refreshes agent watching heartbeat via POST /agents/{agent_id}/watch/heartbeat."""
+        endpoint = f"/agents/{self.config.agent_id}/watch/heartbeat"
+        try:
+            return self._make_request(endpoint, method="POST", body={})
+        except Exception as err:  # noqa: BLE001
+            logger.debug("Failed to send heartbeat to Switch: %s", err)
+            return {"ok": False}
 
     def create_room(
         self,
@@ -362,6 +406,20 @@ class MockSwitchClient:
     def get_room_history(self, room_id: str) -> dict[str, Any]:
         """Simulates fetching room history."""
         return {"events": []}
+
+    def update_status(
+        self,
+        room_id: str | None = None,
+        *,
+        presence: str = "online",
+        status: str = "RepoRescue Active",
+    ) -> dict[str, Any]:
+        """Simulates updating agent status in Switch."""
+        return {"ok": True, "presence": presence, "status": status}
+
+    def send_heartbeat(self) -> dict[str, Any]:
+        """Simulates sending a heartbeat in Switch."""
+        return {"ok": True}
 
     def queue_event(self, event: SwitchMessageEvent) -> None:
         """Injects an inbound event to be returned on the next poll."""
