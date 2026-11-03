@@ -391,6 +391,11 @@ def run_live_demo(
         room_id = room.get("id") or "!reporescue:localhost"
         print(f"  ✓ Created agent room (ID: {room_id})")
 
+    # Update agent presence to ONLINE and send initial heartbeat
+    client.update_status(room_id=room_id, presence="online", status="RepoRescue Active")
+    client.send_heartbeat()
+    print("  ✓ Reported agent presence ONLINE to Switch Core")
+
     # 5. Initialize pristine demo repo & multi-agent orchestrator
     print("\n[Step 5] Initializing demo repo & multi-agent orchestrator...")
     if repo_path:

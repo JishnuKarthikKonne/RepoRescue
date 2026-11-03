@@ -95,22 +95,24 @@ ROLE_SCHEMA_INSTRUCTIONS: dict[str, str] = {
         '  "confidence": "low" | "medium" | "high"\n}'
     ),
     "reproducer": (
-        "Carefully inspect `repository_files` and bug context! Write a minimal, deterministic pytest test that imports from the actual package shown in repository_files and reproduces the reported bug failure when executed.\n"
+        "Carefully inspect `repository_files` and the bug description in the context! Write a minimal, deterministic pytest test that imports from the EXISTING Python module shown in `repository_files` and asserts the expected behavior described in the bug report.\n"
+        "STRICT IMPORT RULE: The test must ONLY import functions/modules that actually exist in `repository_files` (e.g. check the keys of `repository_files`). Do not invent non-existent module paths.\n"
         "Respond with a single JSON object containing:\n"
         '{\n  "test_file": "tests/test_reproduce_<issue_slug>.py",\n'
-        '  "test_code": "import pytest\\nfrom <package> import <function>\\n\\ndef test_reproduce_issue():\\n    ...",\n'
+        '  "test_code": "import pytest\\nfrom <existing_module> import <function>\\n\\ndef test_reproduce_issue():\\n    ...",\n'
         '  "failure_evidence": "description of expected failure output"\n}'
     ),
     "fixer": (
-        "Carefully inspect `repository_files`, `reproduction_test`, and `reproduction_evidence` in the context! Provide the complete updated file content of the actual module(s) in repository_files to fix the bug without breaking existing tests.\n"
+        "Carefully inspect `repository_files`, `reproduction_test_file`, `reproduction_test_code`, and `reproduction_evidence` in the context!\n"
         "CRITICAL FIX RULES:\n"
-        "1. Fix the problem directly and defensively so tests pass and no unhandled exceptions are raised.\n"
-        "2. Preserve existing function signatures, return types, and import statements.\n"
-        "3. Provide the complete updated file content for each file in `file_contents`.\n"
+        "1. Identify the EXACT file in `repository_files` that needs to be fixed. Do NOT invent new files or rename existing modules.\n"
+        "2. Fix the bug defensively so the reproduction test and all existing tests pass.\n"
+        "3. Preserve all existing function signatures, return types, and import statements.\n"
+        "4. In `file_contents`, provide the complete updated file content where the key is the exact relative path of the existing file from `repository_files`.\n"
         "Respond with a single JSON object containing:\n"
-        '{\n  "changed_files": ["path/to/modified_file.py"],\n'
+        '{\n  "changed_files": ["<existing_file_path>"],\n'
         '  "file_contents": {\n'
-        '    "path/to/modified_file.py": "... complete fixed file content ..."\n'
+        '    "<existing_file_path>": "... complete updated file content ..."\n'
         "  },\n"
         '  "rationale": "one-sentence rationale for the fix"\n}'
     ),
