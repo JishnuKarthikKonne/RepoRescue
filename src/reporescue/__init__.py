@@ -10,14 +10,34 @@ from .git_ops import (
 )
 from .models import BugTask, TaskStatus
 from .runner import ExecutionResult, run_command, run_pytest
+from .switch import (
+    MockSwitchClient,
+    RepoRescueDispatcher,
+    SwitchAuthError,
+    SwitchClient,
+    SwitchClientProtocol,
+    SwitchConfig,
+    SwitchError,
+    SwitchMessageEvent,
+    WorkflowFormatter,
+)
 
 __all__ = [
     "BugTask",
     "ExecutionResult",
     "GitError",
     "InvalidWorktreePathError",
+    "MockSwitchClient",
+    "RepoRescueDispatcher",
+    "SwitchAuthError",
+    "SwitchClient",
+    "SwitchClientProtocol",
+    "SwitchConfig",
+    "SwitchError",
+    "SwitchMessageEvent",
     "TaskStatus",
     "UncommittedChangesError",
+    "WorkflowFormatter",
     "WorktreeError",
     "WorktreeInfo",
     "WorktreeManager",
