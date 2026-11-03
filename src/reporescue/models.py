@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
-from datetime import datetime, timezone
 from uuid import uuid4
+
 
 class TaskStatus(StrEnum):
     REPORTED = "reported"
@@ -16,6 +17,7 @@ class TaskStatus(StrEnum):
     REJECTED = "rejected"
     FAILED = "failed"
 
+
 @dataclass
 class BugTask:
     title: str
@@ -23,7 +25,7 @@ class BugTask:
     reporter: str
     task_id: str = field(default_factory=lambda: str(uuid4()))
     status: TaskStatus = TaskStatus.REPORTED
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     evidence: list[str] = field(default_factory=list)
     proposed_branch: str | None = None
     approval_by: str | None = None
