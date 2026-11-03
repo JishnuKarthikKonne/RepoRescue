@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import contextlib
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
 from typing import Any, Protocol
@@ -33,10 +36,21 @@ class GitHubValidationError(GitHubError):
 
 
 def _sanitize_message(message: str, secret: str | None) -> str:
-    """Masks secret token from strings and error messages to prevent leakage."""
-    if not secret or len(secret) < 4:
-        return message
-    return message.replace(secret, "***")
+    """Masks secret tokens and basic auth strings from messages to prevent leakage."""
+    if not message:
+        return ""
+    sanitized = message
+    if secret and len(secret) >= 4:
+        sanitized = sanitized.replace(secret, "***")
+        with contextlib.suppress(Exception):
+            auth_bytes = f"x-access-token:{secret}".encode()
+            b64_val = base64.b64encode(auth_bytes).decode("ascii")
+            if b64_val in sanitized:
+                sanitized = sanitized.replace(b64_val, "***")
+    # Mask common token patterns as defense in depth
+    sanitized = re.sub(r"gh[pousr]_[0-9a-zA-Z]{30,}", "***", sanitized)
+    sanitized = re.sub(r"github_pat_[0-9a-zA-Z_]{60,}", "***", sanitized)
+    return sanitized
 
 
 class GitHubClientProtocol(Protocol):

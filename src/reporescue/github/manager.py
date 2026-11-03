@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from pathlib import Path
@@ -221,7 +222,8 @@ class GitHubPRManager:
     def push_branch(self, worktree_path: Path, branch_name: str) -> str:
         """Pushes the isolated task branch to GitHub without force push.
 
-        Never exposes the bearer token in command strings, logs, or exceptions.
+        Never exposes credentials in command-line arguments, remote URLs, logs, or exceptions.
+        Authenticates via standard Git Smart HTTP Basic Auth or Windows Git Credential Manager.
         """
         # Dry-run or Mock client: simulate push without external network
         if self.config.dry_run or isinstance(self.client, MockGitHubClient):
@@ -236,19 +238,32 @@ class GitHubPRManager:
             )
 
         remote_url = f"https://github.com/{self.config.repository}.git"
-        push_cmd = ["git"]
+        push_cmd = ["git", "push", "-u", remote_url, f"{branch_name}:{branch_name}"]
+
+        # Configure secure in-memory environment for Git
+        push_env: dict[str, str] = {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "never",
+        }
+
         if self.config.token:
-            # Pass authorization via extraHeader to keep token out of remote URL
-            push_cmd.extend(
-                ["-c", f"http.extraHeader=Authorization: Bearer {self.config.token}"]
+            # GitHub Git Smart HTTP strictly requires HTTP Basic Auth (x-access-token:<token>)
+            # Pass via GIT_CONFIG_PARAMETERS so token is NEVER exposed in sys.argv / command-line arguments
+            auth_bytes = f"x-access-token:{self.config.token}".encode()
+            basic_auth = base64.b64encode(auth_bytes).decode("ascii")
+            push_env["GIT_CONFIG_PARAMETERS"] = (
+                f"'http.extraHeader=Authorization: Basic {basic_auth}'"
             )
-        push_cmd.extend(["push", "-u", remote_url, f"{branch_name}:{branch_name}"])
+            push_env["GITHUB_TOKEN"] = self.config.token
+            push_env["GH_TOKEN"] = self.config.token
+            push_env["GCM_TOKEN"] = self.config.token
 
         # Execute push with strict timeout
         res = run_command(
             push_cmd,
             cwd=worktree_path,
             timeout_seconds=self.config.push_timeout_seconds,
+            env=push_env,
         )
 
         sanitized_stdout = _sanitize_message(res.stdout, self.config.token)

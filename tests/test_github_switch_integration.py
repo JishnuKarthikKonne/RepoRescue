@@ -196,3 +196,121 @@ def test_switch_publish_pr_command():
         "Command ignored: Pull Request creation must be initiated by a verified human"
         in mock_client.last_message_content
     )
+
+
+def test_switch_publish_pr_prefix_matching():
+    """Verifies that /publish-pr accepts 8-character prefix for full task UUIDs."""
+    mock_client = MockSwitchClient()
+    dispatcher = RepoRescueDispatcher(mock_client)
+
+    full_uuid = "6eb75ff8-a462-44ee-91ab-e54e1bf0729a"
+    task = _create_awaiting_approval_task(full_uuid, "!room:prefix")
+    task.transition(TaskStatus.APPROVED, actor="LeadEngineer")
+    dispatcher.tasks[task.task_id] = task
+
+    mock_orchestrator = MagicMock()
+    mock_orchestrator.publish_draft_pr.return_value = GitHubPRResult(
+        pr_url="https://api.github.com/repos/org/repo/pulls/88",
+        pr_number=88,
+        html_url="https://github.com/org/repo/pull/88",
+        branch_name="reporescue/task-6eb75ff8",
+        base_branch="main",
+        commit_sha="sha88",
+        title="[RepoRescue] Title",
+        patch_fingerprint="sha256:888",
+        draft=True,
+    )
+    dispatcher.orchestrator = mock_orchestrator
+
+    # User uses short 8-char prefix
+    pub_evt = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room:prefix",
+            "payload": {
+                "body": "/publish-pr 6eb75ff8",
+                "sender": "@developer:localhost",
+                "sender_name": "Developer",
+                "sender_kind": "user",
+            },
+        }
+    )
+    assert pub_evt is not None
+    res = dispatcher.handle_message_event(pub_evt)
+    assert res is not None
+    assert res.task_id == full_uuid
+    mock_orchestrator.publish_draft_pr.assert_called_once_with(task)
+
+
+def test_switch_publish_pr_retry_after_push_failure():
+    """Verifies that an approved task whose PR push fails can be retried via /publish-pr."""
+    mock_client = MockSwitchClient()
+    dispatcher = RepoRescueDispatcher(mock_client)
+
+    full_uuid = "6eb75ff8-a462-44ee-91ab-e54e1bf0729a"
+    task = _create_awaiting_approval_task(full_uuid, "!room:retry")
+    task.transition(TaskStatus.APPROVED, actor="LeadEngineer")
+    dispatcher.tasks[task.task_id] = task
+
+    mock_orchestrator = MagicMock()
+    # 1st attempt fails with push auth error
+    mock_orchestrator.publish_draft_pr.side_effect = [
+        RuntimeError(
+            "fatal: Authentication failed for 'https://github.com/org/repo.git'"
+        ),
+        GitHubPRResult(
+            pr_url="https://api.github.com/repos/org/repo/pulls/99",
+            pr_number=99,
+            html_url="https://github.com/org/repo/pull/99",
+            branch_name="reporescue/task-6eb75ff8",
+            base_branch="main",
+            commit_sha="sha99",
+            title="[RepoRescue] Title",
+            patch_fingerprint="sha256:999",
+            draft=True,
+        ),
+    ]
+    dispatcher.orchestrator = mock_orchestrator
+
+    # 1. First attempt fails
+    evt1 = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room:retry",
+            "payload": {
+                "body": "/publish-pr 6eb75ff8",
+                "sender": "@lead:localhost",
+                "sender_name": "Lead",
+                "sender_kind": "user",
+            },
+        }
+    )
+    res1 = dispatcher.handle_message_event(evt1)
+    assert res1 is not None
+    assert res1.status == TaskStatus.APPROVED
+    assert any(
+        "GitHub PR Publication Failed" in b for _, b, _ in mock_client.sent_messages
+    )
+
+    # 2. Retry succeeds without re-running fixer
+    evt2 = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room:retry",
+            "payload": {
+                "body": "/publish-pr 6eb75ff8",
+                "sender": "@lead:localhost",
+                "sender_name": "Lead",
+                "sender_kind": "user",
+            },
+        }
+    )
+    res2 = dispatcher.handle_message_event(evt2)
+    assert res2 is not None
+    assert any(
+        "Draft Pull Request Created" in b for _, b, _ in mock_client.sent_messages
+    )
+    assert any(
+        "https://github.com/org/repo/pull/99" in b
+        for _, b, _ in mock_client.sent_messages
+    )

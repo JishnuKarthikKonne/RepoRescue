@@ -251,3 +251,159 @@ def test_happy_path_publish_draft_pr_and_idempotency(test_git_worktree):
     assert result2.pr_number == 1
     assert result2.is_existing is True
     assert len(mock_client.created_prs) == 1  # No duplicate created
+
+
+def test_push_branch_uses_basic_auth_in_env_and_never_in_cmd_args(
+    monkeypatch, tmp_path
+):
+    """Verifies Git Smart HTTP Basic Auth is passed via GIT_CONFIG_PARAMETERS and never in sys.argv."""
+    fake_wt = tmp_path / "wt"
+    fake_wt.mkdir()
+
+    cfg = GitHubConfig(
+        repository="owner/repo",
+        token="ghp_testsecrettoken12345",
+        dry_run=False,
+    )
+    # Using real-like client type so it doesn't short-circuit dry_run/mock check
+    from reporescue.github.client import GitHubClient
+
+    mgr = GitHubPRManager(config=cfg, client=GitHubClient(cfg))
+
+    captured_args = {}
+
+    def mock_run_cmd(cmd, cwd=None, timeout_seconds=None, env=None):
+        captured_args["cmd"] = cmd
+        captured_args["env"] = env
+        captured_args["cwd"] = cwd
+        from reporescue.runner import ExecutionResult
+
+        return ExecutionResult(
+            command=list(cmd),
+            exit_code=0,
+            stdout="Everything up-to-date",
+            stderr="",
+            duration_seconds=0.1,
+            timed_out=False,
+            truncated=False,
+        )
+
+    monkeypatch.setattr("reporescue.github.manager.run_command", mock_run_cmd)
+
+    mgr.push_branch(fake_wt, "reporescue/task-001")
+
+    cmd = captured_args["cmd"]
+    env = captured_args["env"]
+
+    # Invariant: Secret token is NEVER in command line arguments (sys.argv)
+    assert "ghp_testsecrettoken12345" not in " ".join(cmd)
+    assert "Authorization" not in " ".join(cmd)
+    assert cmd == [
+        "git",
+        "push",
+        "-u",
+        "https://github.com/owner/repo.git",
+        "reporescue/task-001:reporescue/task-001",
+    ]
+
+    # Invariant: Basic auth is provided in GIT_CONFIG_PARAMETERS in environment
+    assert "GIT_CONFIG_PARAMETERS" in env
+    assert "Authorization: Basic" in env["GIT_CONFIG_PARAMETERS"]
+    assert "GIT_TERMINAL_PROMPT" in env and env["GIT_TERMINAL_PROMPT"] == "0"
+    assert "GCM_INTERACTIVE" in env and env["GCM_INTERACTIVE"] == "never"
+    assert env.get("GITHUB_TOKEN") == "ghp_testsecrettoken12345"
+
+
+def test_push_branch_fallback_to_windows_gcm_when_no_token(monkeypatch, tmp_path):
+    """Verifies that without a token, Git push falls back cleanly to Windows GCM."""
+    fake_wt = tmp_path / "wt"
+    fake_wt.mkdir()
+
+    cfg = GitHubConfig(
+        repository="owner/repo",
+        token=None,
+        dry_run=False,
+    )
+    from reporescue.github.client import GitHubClient
+
+    mgr = GitHubPRManager(config=cfg, client=GitHubClient(cfg))
+
+    captured_args = {}
+
+    def mock_run_cmd(cmd, cwd=None, timeout_seconds=None, env=None):
+        captured_args["cmd"] = cmd
+        captured_args["env"] = env
+        from reporescue.runner import ExecutionResult
+
+        return ExecutionResult(
+            command=list(cmd),
+            exit_code=0,
+            stdout="Everything up-to-date",
+            stderr="",
+            duration_seconds=0.1,
+            timed_out=False,
+            truncated=False,
+        )
+
+    monkeypatch.setattr("reporescue.github.manager.run_command", mock_run_cmd)
+
+    mgr.push_branch(fake_wt, "reporescue/task-002")
+
+    env = captured_args["env"]
+    assert "GIT_CONFIG_PARAMETERS" not in env
+    assert env.get("GIT_TERMINAL_PROMPT") == "0"
+    assert env.get("GCM_INTERACTIVE") == "never"
+
+
+def test_push_branch_failure_leaves_task_approved_and_retryable(
+    test_git_worktree, monkeypatch
+):
+    """Verifies that if push fails, the task remains APPROVED and can be retried without rerunning fix."""
+    from reporescue.github.manager import GitHubManagerError
+
+    wt_path, branch = test_git_worktree
+    mock_client = MockGitHubClient()
+    mgr = GitHubPRManager(
+        config=GitHubConfig(
+            repository="owner/repo",
+            token="ghp_validtokendummy",
+            dry_run=False,
+        ),
+        client=mock_client,
+    )
+
+    fp, _, _ = compute_worktree_patch_fingerprint(wt_path)
+    task = _create_approved_task(branch_name=branch, fp=fp)
+
+    fail_push = True
+
+    def mock_push(worktree_path, branch_name):
+        nonlocal fail_push
+        if fail_push:
+            raise GitHubManagerError(
+                "Failed to push branch 'reporescue/task-test0001' to GitHub: "
+                "remote: invalid credentials\nfatal: Authentication failed"
+            )
+        return "pushed"
+
+    monkeypatch.setattr(mgr, "push_branch", mock_push)
+
+    # 1. First attempt fails due to invalid credentials
+    with pytest.raises(GitHubManagerError, match="fatal: Authentication failed"):
+        mgr.publish_draft_pr(task, wt_path)
+
+    # Invariant: Task remains APPROVED with identical fingerprint and approval actor
+    assert task.status == TaskStatus.APPROVED
+    assert task.approved_patch_fingerprint == fp
+    assert task.approval_by == "LeadDeveloper"
+    assert task.pr_url is None
+    assert len(mock_client.created_prs) == 0
+
+    # 2. Second attempt succeeds (credentials fixed / retry)
+    fail_push = False
+    result = mgr.publish_draft_pr(task, wt_path)
+
+    assert result.pr_number == 1
+    assert task.status == TaskStatus.PR_CREATED
+    assert task.pr_url == result.html_url
+    assert len(mock_client.created_prs) == 1

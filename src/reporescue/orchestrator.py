@@ -169,11 +169,22 @@ class WorkflowOrchestrator:
         self.active_worktrees: dict[str, WorktreeInfo] = {}  # task_id -> WorktreeInfo
 
     def _get_task_worktree(self, task: BugTask) -> WorktreeInfo:
-        """Retrieves or creates the isolated worktree for a task."""
+        """Retrieves or creates the isolated worktree for a task.
+
+        Reuses existing active worktree on disk during retries to preserve verified patch state.
+        """
         if task.task_id in self.active_worktrees:
             return self.active_worktrees[task.task_id]
 
-        branch_name = f"reporescue/task-{task.task_id[:8]}"
+        branch_name = task.proposed_branch or f"reporescue/task-{task.task_id[:8]}"
+
+        # Check if an existing worktree is already registered on disk for this branch
+        for existing in self.worktree_mgr.list_worktrees():
+            if existing.branch == branch_name:
+                self.active_worktrees[task.task_id] = existing
+                task.proposed_branch = branch_name
+                return existing
+
         wt = self.worktree_mgr.create_worktree(branch_name)
         self.active_worktrees[task.task_id] = wt
         task.proposed_branch = branch_name

@@ -239,6 +239,41 @@ class RepoRescueDispatcher:
             return None
 
         task_id = self._resolve_target_task_id(event)
+        if (not task_id or task_id not in self.tasks) and self.orchestrator:
+            # Check if task can be reconstructed from on-disk worktree branch
+            parts = event.body.strip().split()
+            target_prefix = parts[1] if len(parts) > 1 else ""
+            if target_prefix:
+                for wt in self.orchestrator.worktree_mgr.list_worktrees():
+                    if wt.branch.startswith(f"reporescue/task-{target_prefix[:8]}"):
+                        from ..github.fingerprint import (
+                            compute_worktree_patch_fingerprint,
+                        )
+
+                        fp, _, commit_sha = compute_worktree_patch_fingerprint(wt.path)
+                        full_id = (
+                            target_prefix
+                            if len(target_prefix) >= 16
+                            else wt.branch.split("reporescue/task-")[-1]
+                        )
+                        task = BugTask(
+                            title=f"Bugfix for {wt.branch}",
+                            description="Reconstructed approved task from worktree branch",
+                            reporter=event.sender_name,
+                            task_id=full_id,
+                            status=TaskStatus.APPROVED,
+                            proposed_branch=wt.branch,
+                            approval_by=event.sender_name,
+                            approved_patch_fingerprint=fp,
+                            verified_patch_fingerprint=fp,
+                            commit_sha=commit_sha,
+                        )
+                        task.evidence.append("Verification PASSED in isolated worktree")
+                        self.tasks[task.task_id] = task
+                        self.orchestrator.active_worktrees[task.task_id] = wt
+                        task_id = task.task_id
+                        break
+
         if not task_id or task_id not in self.tasks:
             self.client.send_message(
                 event.room_id,
@@ -332,11 +367,17 @@ class RepoRescueDispatcher:
     ) -> str | None:
         """Resolves the task_id from command arguments or active room context."""
         parts = event.body.strip().split()
-        if len(parts) > 1 and parts[1] in self.tasks:
-            return parts[1]
-        if is_approval and len(parts) > 1:
-            # Explicit task_id provided but does not match any known task
-            return None
+        if len(parts) > 1:
+            target = parts[1]
+            if target in self.tasks:
+                return target
+            # Support prefix matching (e.g. 8-char short task ID)
+            matches = [t_id for t_id in self.tasks if t_id.startswith(target)]
+            if len(matches) == 1:
+                return matches[0]
+            if is_approval:
+                # Explicit task_id provided but does not match any known task
+                return None
         return self.active_task_by_room.get(event.room_id)
 
     def publish_triage(

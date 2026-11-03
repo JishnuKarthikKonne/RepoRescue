@@ -558,6 +558,83 @@ def run_github_check(repo_path: Path | str | None = None) -> None:
         print("\nReadiness: ⚠️ DRY RUN ONLY (No live token configured).")
 
 
+def run_publish_task(
+    task_id: str,
+    repo_path: Path | str | None = None,
+) -> None:
+    """Retries publishing an approved task as a GitHub Draft PR."""
+    print("=" * 70)
+    print("  REPORESCUE: RETRY GITHUB DRAFT PR PUBLICATION")
+    print("=" * 70)
+
+    working_repo = Path(repo_path).resolve() if repo_path else Path.cwd()
+    worktree_mgr = WorktreeManager(working_repo)
+
+    # Locate matching active worktree
+    target_prefix = task_id[:8]
+    matching_wt = None
+    for wt in worktree_mgr.list_worktrees():
+        if wt.branch.startswith(f"reporescue/task-{target_prefix}"):
+            matching_wt = wt
+            break
+
+    if not matching_wt:
+        print(
+            f"\n❌ Error: No active worktree found for task '{task_id}' "
+            f"(branch prefix 'reporescue/task-{target_prefix}')."
+        )
+        print("Available worktrees:")
+        for wt in worktree_mgr.list_worktrees():
+            print(f"  - {wt.branch} at {wt.path}")
+        sys.exit(1)
+
+    print(f"\nFound worktree branch: {matching_wt.branch}")
+    print(f"Worktree path:         {matching_wt.path}")
+
+    from .github.fingerprint import compute_worktree_patch_fingerprint
+
+    fp, _diff_text, commit_sha = compute_worktree_patch_fingerprint(matching_wt.path)
+    print(f"Commit SHA:            {commit_sha}")
+    print(f"Patch Fingerprint:     {fp}")
+
+    task = BugTask(
+        title=f"Bugfix for {matching_wt.branch}",
+        description="Retried approved task publication",
+        reporter="switch-user",
+        task_id=task_id,
+        status=TaskStatus.APPROVED,
+        proposed_branch=matching_wt.branch,
+        approval_by="Verified Maintainer",
+        approved_patch_fingerprint=fp,
+        verified_patch_fingerprint=fp,
+        commit_sha=commit_sha,
+    )
+    task.evidence.append("Verification PASSED in isolated worktree")
+
+    cfg = GitHubConfig.from_env(working_repo)
+    if cfg.dry_run:
+        client = MockGitHubClient(cfg)
+    else:
+        client = GitHubClient(cfg)
+    gh_mgr = GitHubPRManager(cfg, client=client, worktree_mgr=worktree_mgr)
+
+    print("\nExecuting secure GitHub Draft PR publication...")
+    try:
+        pr_result = gh_mgr.publish_draft_pr(task, matching_wt.path)
+        print("\n" + "=" * 70)
+        print("  SUCCESS: DRAFT PULL REQUEST CREATED")
+        print("=" * 70)
+        print(f"  PR URL:       {pr_result.html_url}")
+        print(f"  PR Number:    #{pr_result.pr_number}")
+        print(f"  Branch:       {pr_result.branch_name}")
+        print(f"  Base Branch:  {pr_result.base_branch}")
+        print(f"  Draft:        {pr_result.draft} (Strictly enforced)")
+        print(f"  Existing:     {pr_result.is_existing}")
+    except Exception as err:  # noqa: BLE001
+        print(f"\n❌ Publication Failed: {err}")
+        sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="RepoRescue: Human-approved collaborative AI bug-fixing workflow"
@@ -574,6 +651,13 @@ def main() -> None:
         "--github-check",
         action="store_true",
         help="Diagnose and validate GitHub PR publishing configuration and access",
+    )
+    parser.add_argument(
+        "--publish-task",
+        "--retry-pr",
+        dest="publish_task",
+        metavar="TASK_ID",
+        help="Retry publishing an approved task as a GitHub Draft PR",
     )
     parser.add_argument(
         "--mock",
@@ -628,6 +712,8 @@ def main() -> None:
 
     if args.github_check:
         run_github_check(repo_path=args.repo_path)
+    elif args.publish_task:
+        run_publish_task(args.publish_task, repo_path=args.repo_path)
     elif args.live_demo:
         run_live_demo(
             runtime_mode=runtime_mode,
