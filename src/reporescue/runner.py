@@ -43,6 +43,7 @@ def run_command(
     timeout_seconds: float = 60.0,
     max_output_chars: int = 20_000,
     env: dict[str, str] | None = None,
+    input: str | None = None,
 ) -> ExecutionResult:
     """Executes a command safely without shell=True, capturing metrics and output.
 
@@ -52,6 +53,7 @@ def run_command(
         timeout_seconds: Maximum wall-clock time in seconds before terminating.
         max_output_chars: Maximum characters allowed before truncating stdout/stderr.
         env: Optional environment variables dictionary.
+        input: Optional string input to deliver to standard input.
 
     Returns:
         ExecutionResult containing exit code, stdout, stderr, duration, and flags.
@@ -73,6 +75,7 @@ def run_command(
         completed = subprocess.run(
             cmd_list,
             cwd=working_dir,
+            input=input,
             check=False,
             capture_output=True,
             text=True,

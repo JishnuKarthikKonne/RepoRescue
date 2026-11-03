@@ -15,7 +15,12 @@ from .client import (
     MockGitHubClient,
     _sanitize_message,
 )
-from .config import GitHubConfig
+from .config import (
+    GitHubConfig,
+    detect_repository_origin,
+    get_orchestrator_repository,
+    is_demo_repository,
+)
 from .evidence import build_pr_body, build_pr_title
 from .fingerprint import compute_worktree_patch_fingerprint
 from .models import GitHubPRRequest, GitHubPRResult
@@ -210,11 +215,54 @@ class GitHubPRManager:
                 f"Gate G Failed: Detected sensitive credentials in patch: {', '.join(secrets)}."
             )
 
-        # Gate H: Git repository and remote validated
+        # Gate H: Git repository and configuration validated
         config_errors = self.config.validate()
         if config_errors:
             raise SafetyGateViolationError(
                 f"Gate H Failed: Configuration validation errors: {'; '.join(config_errors)}"
+            )
+
+        # Gate K: Multi-Repository Isolation
+        is_demo = is_demo_repository(wt_resolved) or self.config.is_demo
+        wt_origin = detect_repository_origin(wt_resolved)
+        orchestrator_repo = (
+            self.config.orchestrator_repository
+            or get_orchestrator_repository(wt_resolved)
+        )
+
+        if is_demo:
+            if (
+                orchestrator_repo
+                and self.config.repository
+                and self.config.repository.lower() == orchestrator_repo.lower()
+            ):
+                raise SafetyGateViolationError(
+                    f"Gate K Failed: Repository Isolation Violation: Demo repository patches cannot be published "
+                    f"to the RepoRescue orchestrator repository ('{self.config.repository}'). "
+                    f"The demo repository must target an independent repository."
+                )
+            if (
+                not wt_origin
+                and not self.config.dry_run
+                and not isinstance(self.client, MockGitHubClient)
+            ):
+                import os
+
+                if not os.getenv("DEMO_GITHUB_REPOSITORY"):
+                    raise SafetyGateViolationError(
+                        "Gate K Failed: Repository Isolation Violation: Demo repository (.reporescue/demo_repo) has "
+                        "no configured GitHub remote origin. The demo coupon patch cannot be published until an "
+                        "independent GitHub repository is configured as the demo repository's remote origin."
+                    )
+
+        if (
+            wt_origin
+            and self.config.repository
+            and wt_origin.lower() != self.config.repository.lower()
+        ):
+            raise SafetyGateViolationError(
+                f"Gate K Failed: Repository Isolation Violation: Worktree origin remote '{wt_origin}' "
+                f"does not match configured target repository '{self.config.repository}'."
             )
 
         return fp, diff_text, commit_sha
@@ -247,16 +295,22 @@ class GitHubPRManager:
         }
 
         if self.config.token:
-            # GitHub Git Smart HTTP strictly requires HTTP Basic Auth (x-access-token:<token>)
-            # Pass via GIT_CONFIG_PARAMETERS so token is NEVER exposed in sys.argv / command-line arguments
+            # Explicit token: Git Smart HTTP Basic Auth (x-access-token:<token>)
+            # Explicitly clear credential.helper so Git NEVER falls back to GCM or another account
             auth_bytes = f"x-access-token:{self.config.token}".encode()
             basic_auth = base64.b64encode(auth_bytes).decode("ascii")
             push_env["GIT_CONFIG_PARAMETERS"] = (
-                f"'http.extraHeader=Authorization: Basic {basic_auth}'"
+                f"'credential.helper=' 'http.extraHeader=Authorization: Basic {basic_auth}'"
             )
             push_env["GITHUB_TOKEN"] = self.config.token
             push_env["GH_TOKEN"] = self.config.token
             push_env["GCM_TOKEN"] = self.config.token
+        else:
+            # Fallback to local Git Credential Manager only with explicit user warning
+            logger.warning(
+                "No explicit GITHUB_TOKEN configured. Falling back to local Git Credential Manager (GCM). "
+                "Set GITHUB_TOKEN for deterministic headless CI/CD authentication."
+            )
 
         # Execute push with strict timeout
         res = run_command(

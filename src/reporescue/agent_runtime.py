@@ -59,6 +59,10 @@ class AgentRuntimeProtocol(Protocol):
         """Executes an agent request and returns validated structured data."""
         ...
 
+    def check_health(self) -> tuple[bool, str]:
+        """Validates that the runtime is healthy, configured, and responsive."""
+        ...
+
 
 def load_agent_prompt(role: str, repo_root: Path | None = None) -> str:
     """Loads the role prompt instructions from agents/<role>.md if available."""
@@ -91,22 +95,24 @@ ROLE_SCHEMA_INSTRUCTIONS: dict[str, str] = {
         '  "confidence": "low" | "medium" | "high"\n}'
     ),
     "reproducer": (
-        "Carefully inspect `repository_files` in the context! Write a minimal, deterministic pytest test that imports from the actual package shown in repository_files (e.g. `from shop.checkout import calculate_order_total`) and reproduces the reported bug failure when executed.\n"
+        "Carefully inspect `repository_files` and the bug description in the context! Write a minimal, deterministic pytest test that imports from the EXISTING Python module shown in `repository_files` and asserts the expected behavior described in the bug report.\n"
+        "STRICT IMPORT RULE: The test must ONLY import functions/modules that actually exist in `repository_files` (e.g. check the keys of `repository_files`). Do not invent non-existent module paths.\n"
         "Respond with a single JSON object containing:\n"
-        '{\n  "test_file": "tests/test_reproduce_coupon_500.py",\n'
-        '  "test_code": "from shop.checkout import calculate_order_total\\n\\ndef test_reproduce_expired_coupon_500():\\n    items = [{\\"price\\": 100.0, \\"quantity\\": 1}]\\n    total = calculate_order_total(items, coupon_code=\\"EXPIRED\\")\\n    assert total == 100.0\\n",\n'
+        '{\n  "test_file": "tests/test_reproduce_<issue_slug>.py",\n'
+        '  "test_code": "import pytest\\nfrom <existing_module> import <function>\\n\\ndef test_reproduce_issue():\\n    ...",\n'
         '  "failure_evidence": "description of expected failure output"\n}'
     ),
     "fixer": (
-        "Carefully inspect `repository_files` and `reproduction_evidence` in the context! Provide the complete updated file content of the actual module in repository_files (e.g. `src/shop/checkout.py`) to fix the bug without breaking existing tests.\n"
+        "Carefully inspect `repository_files`, `reproduction_test_file`, `reproduction_test_code`, and `reproduction_evidence` in the context!\n"
         "CRITICAL FIX RULES:\n"
-        "1. Fix the problem directly and defensively so tests pass and no unhandled exceptions are raised.\n"
-        "2. Preserve existing function signatures, return types, and import statements.\n"
-        "3. Keep 'from __future__ import annotations' at the top of the file; never import builtin types like 'list', 'dict', 'float', 'str' from typing.\n"
+        "1. Identify the EXACT file in `repository_files` that needs to be fixed. Do NOT invent new files or rename existing modules.\n"
+        "2. Fix the bug defensively so the reproduction test and all existing tests pass.\n"
+        "3. Preserve all existing function signatures, return types, and import statements.\n"
+        "4. In `file_contents`, provide the complete updated file content where the key is the exact relative path of the existing file from `repository_files`.\n"
         "Respond with a single JSON object containing:\n"
-        '{\n  "changed_files": ["src/shop/checkout.py"],\n'
+        '{\n  "changed_files": ["<existing_file_path>"],\n'
         '  "file_contents": {\n'
-        '    "src/shop/checkout.py": "... complete fixed file content ..."\n'
+        '    "<existing_file_path>": "... complete updated file content ..."\n'
         "  },\n"
         '  "rationale": "one-sentence rationale for the fix"\n}'
     ),
@@ -256,6 +262,13 @@ class MockAgentRuntime:
     def set_custom_response(self, role: str, data: dict[str, Any]) -> None:
         """Allows test suites to override responses for specific roles."""
         self.custom_responses[role] = data
+
+    def check_health(self) -> tuple[bool, str]:
+        """Validates that the mock runtime is healthy and ready."""
+        return (
+            True,
+            f"MockAgentRuntime ({self.runtime_name}) active (deterministic simulation)",
+        )
 
     def run_agent(self, request: AgentRequest) -> AgentResult:
         start_time = time.perf_counter()
@@ -418,6 +431,33 @@ class OpenAICompatibleRuntime:
         self.runtime_name = runtime_name or f"openai/{self.model}"
         self.is_simulation = False
         self.http_handler = http_handler
+
+    def check_health(self) -> tuple[bool, str]:
+        """Checks if the OpenAI-compatible endpoint is reachable and responsive."""
+        if self.http_handler:
+            return True, f"Mocked handler active for {self.runtime_name}"
+        try:
+            endpoint = f"{self.base_url}/models"
+            headers = {"User-Agent": "RepoRescue/0.1.0"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            req = urllib.request.Request(endpoint, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                if resp.status == 200:
+                    return (
+                        True,
+                        f"Healthy: {self.runtime_name} at {self.base_url} (HTTP 200)",
+                    )
+                return False, f"Provider returned HTTP {resp.status}"
+        except urllib.error.HTTPError as err:
+            if err.code in (404, 405):
+                return (
+                    True,
+                    f"Healthy: {self.runtime_name} at {self.base_url} (Endpoint reachable)",
+                )
+            return False, f"Provider error (HTTP {err.code}): {err.reason}"
+        except Exception as err:  # noqa: BLE001
+            return False, f"Provider unreachable at {self.base_url}: {err}"
 
     def run_agent(self, request: AgentRequest) -> AgentResult:
         start_time = time.perf_counter()

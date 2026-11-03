@@ -21,8 +21,8 @@ if hasattr(sys.stderr, "reconfigure"):
 from .agent_runtime import AgentRuntimeFactory, RuntimeConfigurationError
 from .demo import init_demo_repository
 from .git_ops import WorktreeManager
-from .github.client import GitHubClient, MockGitHubClient
-from .github.config import GitHubConfig
+from .github.client import GitHubClient, GitHubClientProtocol, MockGitHubClient
+from .github.config import GitHubConfig, is_demo_repository
 from .github.manager import GitHubPRManager
 from .models import BugTask, TaskStatus
 from .orchestrator import WorkflowOrchestrator
@@ -64,11 +64,35 @@ def run_listener(
     if not pref and (mock or demo):
         pref = "mock"
 
+    if pref == "real":
+        from .agent_runtime import check_ollama_alive
+
+        if (
+            not (
+                os.getenv("OPENAI_API_KEY")
+                or os.getenv("LLM_BASE_URL")
+                or os.getenv("OLLAMA_HOST")
+            )
+            and check_ollama_alive()
+        ):
+            logger.info("Detected local Ollama instance at http://127.0.0.1:11434")
+            os.environ["OLLAMA_HOST"] = "http://127.0.0.1:11434"
+
     try:
         runtime = AgentRuntimeFactory.get_runtime(pref)
     except RuntimeConfigurationError as err:
         logger.error("Configuration error initializing real AI runtime: %s", err)
         sys.exit(1)
+
+    healthy, health_msg = runtime.check_health()
+    if not healthy:
+        if pref == "real":
+            logger.error("AI runtime health check failed: %s", health_msg)
+            sys.exit(1)
+        else:
+            logger.warning("AI runtime health warning: %s", health_msg)
+    else:
+        logger.info("AI runtime health: %s", health_msg)
 
     is_sim = getattr(runtime, "is_simulation", True)
     rt_name = getattr(runtime, "runtime_name", "mock")
@@ -96,7 +120,7 @@ def run_listener(
         ):
             logger.info("Auto-registering RepoRescue agent with Switch server...")
             try:
-                agent_id, _ = client.register_agent()
+                agent_id, _ = client.register_agent(name="reporescue-agent")
                 logger.info("Successfully registered agent ID: %s", agent_id)
             except (SwitchError, urllib.error.URLError, OSError) as err:
                 logger.warning("Could not auto-register agent: %s", err)
@@ -367,6 +391,11 @@ def run_live_demo(
         room_id = room.get("id") or "!reporescue:localhost"
         print(f"  ✓ Created agent room (ID: {room_id})")
 
+    # Update agent presence to ONLINE and send initial heartbeat
+    client.update_status(room_id=room_id, presence="online", status="RepoRescue Active")
+    client.send_heartbeat()
+    print("  ✓ Reported agent presence ONLINE to Switch Core")
+
     # 5. Initialize pristine demo repo & multi-agent orchestrator
     print("\n[Step 5] Initializing demo repo & multi-agent orchestrator...")
     if repo_path:
@@ -377,8 +406,28 @@ def run_live_demo(
     print(f"  ✓ Working repository at {working_repo}")
 
     pref = runtime_mode or (
-        "real" if (os.getenv("OPENAI_API_KEY") or os.getenv("LLM_BASE_URL")) else "mock"
+        "real"
+        if (
+            os.getenv("OPENAI_API_KEY")
+            or os.getenv("LLM_BASE_URL")
+            or os.getenv("OLLAMA_HOST")
+        )
+        else "mock"
     )
+    if pref == "real":
+        from .agent_runtime import check_ollama_alive
+
+        if (
+            not (
+                os.getenv("OPENAI_API_KEY")
+                or os.getenv("LLM_BASE_URL")
+                or os.getenv("OLLAMA_HOST")
+            )
+            and check_ollama_alive()
+        ):
+            logger.info("Detected local Ollama instance at http://127.0.0.1:11434")
+            os.environ["OLLAMA_HOST"] = "http://127.0.0.1:11434"
+
     try:
         runtime = AgentRuntimeFactory.get_runtime(pref)
     except (RuntimeConfigurationError, OSError, ValueError):
@@ -499,61 +548,128 @@ def run_live_demo(
 
 
 def run_github_check(repo_path: Path | str | None = None) -> None:
-    """Diagnoses and validates GitHub PR publishing configuration and access."""
+    """Diagnoses and validates GitHub PR publishing configuration, Smart HTTP access, and repo isolation."""
     print("=" * 70)
     print("  REPORESCUE: GITHUB INTEGRATION DIAGNOSTIC CHECK")
     print("=" * 70)
 
     working_repo = Path(repo_path).resolve() if repo_path else Path.cwd()
-    cfg = GitHubConfig.from_env(working_repo)
+    from .github.config import (
+        detect_repository_origin,
+        get_orchestrator_repository,
+        is_demo_repository,
+    )
 
-    print(f"\nTarget Repository:    {cfg.repository or '<not configured>'}")
-    print(f"Base Branch:          {cfg.base_branch}")
-    print(f"API Endpoint:         {cfg.api_url}")
-    print(f"Draft Enforcement:    {cfg.draft} (Strictly enforced)")
-    print(f"Dry Run Mode:         {cfg.dry_run}")
-    print(f"Repository Allowlist: {cfg.repository_allowlist or '<none>'}")
-    print(f"Token Configuration:  {cfg.masked_token}")
+    is_demo = is_demo_repository(working_repo)
+    cfg = GitHubConfig.from_env(working_repo, is_demo=is_demo)
+
+    print(
+        f"\nRepository Context:    {'Demo App (.reporescue/demo_repo)' if is_demo else 'Standard Repository'}"
+    )
+    print(f"Local Working Dir:     {working_repo}")
+    print(f"Target Repository:     {cfg.repository or '<not configured>'}")
+    print(f"Base Branch:           {cfg.base_branch}")
+    print(f"API Endpoint:          {cfg.api_url}")
+    print(f"Draft Enforcement:     {cfg.draft} (Strictly enforced)")
+    print(f"Dry Run Mode:          {cfg.dry_run}")
+    print(f"Repository Allowlist:  {cfg.repository_allowlist or '<none>'}")
+    print(f"Token Configuration:   {cfg.masked_token}")
 
     errors = cfg.validate()
     if errors:
-        print("\n[Configuration Issues]:")
+        print("\n[Configuration & Isolation Issues]:")
         for err in errors:
             print(f"  ✗ {err}")
         print("\nReadiness: 🛑 NOT READY for live GitHub publishing.")
-        print(
-            "Note: Set GITHUB_TOKEN and GITHUB_REPOSITORY (or configure git remote origin)."
-        )
-        print(
-            "      Deterministic mock publishing is available offline via --mock or GITHUB_DRY_RUN=1."
-        )
+        if is_demo:
+            print(
+                "Remediation for Demo Repository:\n"
+                "  1. Set an independent GitHub target for demo coupons:\n"
+                "     $env:DEMO_GITHUB_REPOSITORY = '<username>/<demo-repo>'\n"
+                "     (Or: git -C .reporescue/demo_repo remote add origin https://github.com/<username>/<demo-repo>.git)\n"
+                "  2. For dry-run simulation: $env:GITHUB_DRY_RUN = '1'"
+            )
+        else:
+            print(
+                "Note: Set GITHUB_TOKEN and GITHUB_REPOSITORY (or configure git remote origin)."
+            )
         return
 
-    # If configured with a token, perform live check
-    if cfg.token:
-        print("\n[Validating Authentication & Repository Access with GitHub API...]")
-        client = GitHubClient(cfg)
-        try:
-            repo_info = client.check_auth_and_repo()
-            full_name = repo_info.get("full_name", cfg.repository)
-            default_branch = repo_info.get("default_branch", "main")
-            permissions = repo_info.get("permissions", {})
-            can_push = permissions.get("push", False)
-            can_pull = permissions.get("pull", False)
+    # Multi-Repository Isolation Check
+    orchestrator_repo = cfg.orchestrator_repository or get_orchestrator_repository(
+        working_repo
+    )
+    wt_origin = detect_repository_origin(working_repo)
 
-            print(f"  ✓ Connected to repository: {full_name}")
-            print(f"  ✓ Default branch: {default_branch}")
-            print(f"  ✓ Permissions: push={can_push}, pull={can_pull}")
+    print("\n[Stage 1: Multi-Repository Isolation Analysis]")
+    if is_demo:
+        if (
+            orchestrator_repo
+            and cfg.repository
+            and cfg.repository.lower() == orchestrator_repo.lower()
+        ):
+            print(
+                f"  ✗ Isolation Failure: Demo repository target points to main RepoRescue orchestrator ('{cfg.repository}')."
+            )
+            print(
+                "    Safety rule: Main RepoRescue project must NEVER receive demo coupon patches."
+            )
+            print("\nReadiness: 🛑 NOT READY (Isolation gate failure).")
+            return
+        print(
+            f"  ✓ Demo repository isolated from orchestrator codebase ('{orchestrator_repo or 'unknown'}')"
+        )
+        if wt_origin:
+            print(f"  ✓ Demo git origin matches configured target: {wt_origin}")
+        elif os.getenv("DEMO_GITHUB_REPOSITORY"):
+            print(
+                f"  ✓ Demo target explicitly configured via DEMO_GITHUB_REPOSITORY: {cfg.repository}"
+            )
+    else:
+        print("  ✓ Standard repository workflow (non-demo)")
+        if wt_origin:
+            print(f"  ✓ Local remote origin: {wt_origin}")
 
-            if not can_push:
+    # Authentication & Git Smart HTTP Preflight Check
+    if cfg.token or cfg.dry_run:
+        print("\n[Stage 2: GitHub REST API Authentication & Repository Metadata]")
+        client: GitHubClientProtocol = (
+            MockGitHubClient(cfg) if cfg.dry_run else GitHubClient(cfg)
+        )
+
+        preflight = client.preflight_git_receive_pack()
+
+        if preflight.api_authenticated:
+            user_disp = (
+                f" as user '{preflight.api_username}'" if preflight.api_username else ""
+            )
+            print(f"  ✓ Connected to GitHub REST API{user_disp}")
+            print(f"  ✓ Target repository access verified: {cfg.repository}")
+            print(
+                f"  ✓ API role-based write permission: push={preflight.api_push_permission}"
+            )
+        else:
+            print(f"  ✗ REST API Authentication Failed: {preflight.error_message}")
+            print("\nReadiness: 🛑 NOT READY (REST API authentication failed).")
+            return
+
+        print("\n[Stage 3: Git Smart HTTP Service Authorization (git-receive-pack)]")
+        if preflight.git_smart_http_authorized:
+            print("  ✓ Git Smart HTTP Push Preflight: AUTHORIZED (HTTP 200)")
+            print(
+                "  ✓ Verified Git Smart HTTP receives push capabilities for this token"
+            )
+            print("\nReadiness: ✅ READY for secure Draft PR publishing.")
+        else:
+            print(f"  ✗ Git Smart HTTP Push: DENIED (Status {preflight.status_code})")
+            print(f"    Error: {preflight.error_message}")
+            if preflight.diagnostic_guidance:
                 print(
-                    "  ⚠️ Warning: Token does not appear to have 'push' permission on this repository."
+                    f"\n[Diagnostic Analysis & Remediation]:\n{preflight.diagnostic_guidance}"
                 )
-            else:
-                print("\nReadiness: ✅ READY for secure Draft PR publishing.")
-        except Exception as err:  # noqa: BLE001
-            print(f"  ✗ API Validation Failed: {err}")
-            print("\nReadiness: 🛑 NOT READY (API check failed).")
+            print(
+                "\nReadiness: 🛑 NOT READY (Git push permission denied despite REST role)."
+            )
     else:
         print("\nReadiness: ⚠️ DRY RUN ONLY (No live token configured).")
 
@@ -611,7 +727,9 @@ def run_publish_task(
     )
     task.evidence.append("Verification PASSED in isolated worktree")
 
-    cfg = GitHubConfig.from_env(working_repo)
+    is_demo = is_demo_repository(matching_wt.path) or is_demo_repository(working_repo)
+    cfg = GitHubConfig.from_env(working_repo, is_demo=is_demo)
+
     if cfg.dry_run:
         client = MockGitHubClient(cfg)
     else:
@@ -719,10 +837,19 @@ def main() -> None:
             runtime_mode=runtime_mode,
             repo_path=args.repo_path,
         )
-    elif args.listen or args.mock or args.demo or args.real:
+    elif args.listen:
         run_listener(
-            mock=args.mock or (not args.listen),
-            demo=args.demo or args.real,
+            mock=args.mock,
+            demo=args.demo,
+            runtime_mode=runtime_mode,
+            room_id=args.room_id,
+            poll_interval=args.poll_interval,
+            repo_path=args.repo_path,
+        )
+    elif args.demo or args.mock or (args.real and not args.listen):
+        run_listener(
+            mock=True,
+            demo=True,
             runtime_mode=runtime_mode,
             room_id=args.room_id,
             poll_interval=args.poll_interval,

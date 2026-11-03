@@ -115,7 +115,7 @@ def collect_repo_files(
     for p in root.rglob("*"):
         if not p.is_file():
             continue
-        rel = p.relative_to(root).as_posix()
+        rel_path = p.relative_to(root)
         if any(
             part
             in (
@@ -128,9 +128,10 @@ def collect_repo_files(
                 "build",
                 "dist",
             )
-            for part in p.parts
+            for part in rel_path.parts
         ):
             continue
+        rel = rel_path.as_posix()
         if p.suffix in (".py", ".toml", ".md", ".txt"):
             try:
                 files[rel] = p.read_text(encoding="utf-8", errors="replace")[:max_bytes]
@@ -321,6 +322,8 @@ class WorkflowOrchestrator:
             role="reproducer",
             context={
                 "task_id": task.task_id,
+                "title": task.title,
+                "description": task.description,
                 "root_cause": invest_res.probable_root_cause,
                 "affected_files": invest_res.affected_files,
                 "reproduction_strategy": invest_res.reproduction_strategy,
@@ -401,7 +404,11 @@ class WorkflowOrchestrator:
             role="fixer",
             context={
                 "task_id": task.task_id,
+                "title": task.title,
+                "description": task.description,
                 "root_cause": invest_res.probable_root_cause,
+                "reproduction_test_file": repro_res.test_file,
+                "reproduction_test_code": repro_res.test_code,
                 "reproduction_evidence": repro_res.failure_evidence,
                 "branch_name": wt.branch,
                 "worktree_path": str(wt.path),
