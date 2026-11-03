@@ -545,33 +545,59 @@ class AgentRuntimeFactory:
             base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL")
         )
 
-        # Check if local Ollama daemon is active if no custom url was specified
+        ollama_host_env = os.getenv("OLLAMA_HOST", "").strip()
+        ollama_model_env = os.getenv("OLLAMA_MODEL", "").strip()
+        is_ollama_configured = bool(ollama_host_env or ollama_model_env)
+
         ollama_active = False
         target_model = model
-        if not key and not custom_url:
-            ollama_url = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+
+        # Check if local Ollama daemon is active ONLY if Ollama is explicitly configured
+        if not key and not custom_url and is_ollama_configured:
+            ollama_url = (ollama_host_env or "http://127.0.0.1:11434").rstrip("/")
+            target_model = (
+                model or ollama_model_env or os.getenv("OPENAI_MODEL") or "qwen3:8b"
+            )
             if check_ollama_alive(ollama_url):
                 ollama_active = True
                 custom_url = f"{ollama_url}/v1"
-                target_model = (
-                    model
-                    or os.getenv("OLLAMA_MODEL")
-                    or os.getenv("OPENAI_MODEL")
-                    or "qwen3:8b"
+            elif preference == "real":
+                raise RuntimeConfigurationError(
+                    f"Ollama is explicitly configured ({ollama_url}), but the Ollama daemon "
+                    f"is not reachable at {ollama_url}/api/version."
                 )
 
+        has_provider = bool(key or custom_url or ollama_active)
+
         if preference == "real":
-            if not key and not custom_url and not ollama_active:
+            if not has_provider:
                 raise RuntimeConfigurationError(
                     "Real AI runtime requested, but neither OPENAI_API_KEY (or LLM_API_KEY) "
                     "nor OPENAI_BASE_URL (or LLM_BASE_URL) is configured, and no local Ollama "
                     "instance was detected on http://127.0.0.1:11434."
                 )
-            rt_label = (
-                f"ollama/{target_model}"
-                if ollama_active
-                else f"openai/{target_model or 'gpt-4o-mini'}"
+            is_ollama = ollama_active or (
+                bool(custom_url)
+                and any(x in custom_url.lower() for x in ("11434", "ollama"))
             )
+            if is_ollama:
+                target_model = (
+                    target_model
+                    or ollama_model_env
+                    or os.getenv("OLLAMA_MODEL")
+                    or os.getenv("OPENAI_MODEL")
+                    or "qwen3:8b"
+                )
+                rt_label = f"ollama/{target_model}"
+            else:
+                target_model = (
+                    target_model
+                    or os.getenv("OPENAI_MODEL")
+                    or os.getenv("LLM_MODEL")
+                    or "gpt-4o-mini"
+                )
+                rt_label = f"openai/{target_model}"
+
             logger.info("Initializing real AI agent runtime: %s", rt_label)
             return OpenAICompatibleRuntime(
                 api_key=key,
@@ -581,13 +607,30 @@ class AgentRuntimeFactory:
                 runtime_name=rt_label,
             )
 
-        # Auto-detect: if credentials or active local Ollama are detected, use real provider
-        if key or custom_url or ollama_active:
-            rt_label = (
-                f"ollama/{target_model}"
-                if ollama_active
-                else f"openai/{target_model or 'gpt-4o-mini'}"
+        # Auto-detect: if credentials or active configured Ollama are detected, use real provider
+        if has_provider:
+            is_ollama = ollama_active or (
+                bool(custom_url)
+                and any(x in custom_url.lower() for x in ("11434", "ollama"))
             )
+            if is_ollama:
+                target_model = (
+                    target_model
+                    or ollama_model_env
+                    or os.getenv("OLLAMA_MODEL")
+                    or os.getenv("OPENAI_MODEL")
+                    or "qwen3:8b"
+                )
+                rt_label = f"ollama/{target_model}"
+            else:
+                target_model = (
+                    target_model
+                    or os.getenv("OPENAI_MODEL")
+                    or os.getenv("LLM_MODEL")
+                    or "gpt-4o-mini"
+                )
+                rt_label = f"openai/{target_model}"
+
             logger.info(
                 "Active AI provider detected (%s). Using real AI runtime.",
                 rt_label,

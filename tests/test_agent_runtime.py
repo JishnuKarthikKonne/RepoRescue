@@ -4,6 +4,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -341,3 +342,95 @@ def test_mock_agent_runtime_all_roles():
         assert result.is_simulation is True
         assert isinstance(result.structured_data, dict)
         assert len(result.structured_data) > 0
+
+
+# -----------------------------------------------------------------------------
+# 6. Provider Selection Regression Tests
+# -----------------------------------------------------------------------------
+
+
+def test_runtime_factory_explicit_ollama_host_success(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("OLLAMA_HOST", "http://mock-ollama:11434")
+
+    with patch(
+        "reporescue.agent_runtime.check_ollama_alive", return_value=True
+    ) as mock_alive:
+        runtime = AgentRuntimeFactory.get_runtime("real")
+        assert isinstance(runtime, OpenAICompatibleRuntime)
+        assert runtime.base_url == "http://mock-ollama:11434/v1"
+        assert "ollama" in runtime.runtime_name
+        mock_alive.assert_called_once_with("http://mock-ollama:11434")
+
+
+def test_runtime_factory_explicit_ollama_host_unreachable_real(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("OLLAMA_HOST", "http://mock-ollama:11434")
+
+    with (
+        patch("reporescue.agent_runtime.check_ollama_alive", return_value=False),
+        pytest.raises(
+            RuntimeConfigurationError, match="Ollama is explicitly configured"
+        ),
+    ):
+        AgentRuntimeFactory.get_runtime("real")
+
+
+def test_runtime_factory_explicit_ollama_host_unreachable_auto_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("OLLAMA_HOST", "http://mock-ollama:11434")
+
+    with patch("reporescue.agent_runtime.check_ollama_alive", return_value=False):
+        runtime = AgentRuntimeFactory.get_runtime()
+        assert isinstance(runtime, MockAgentRuntime)
+
+
+def test_runtime_factory_explicit_ollama_model(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("OLLAMA_MODEL", "mistral:latest")
+
+    with patch("reporescue.agent_runtime.check_ollama_alive", return_value=True):
+        runtime = AgentRuntimeFactory.get_runtime()
+        assert isinstance(runtime, OpenAICompatibleRuntime)
+        assert runtime.model == "mistral:latest"
+        assert runtime.runtime_name == "ollama/mistral:latest"
+
+
+def test_runtime_factory_real_without_config_never_silently_mocks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    monkeypatch.delenv("OLLAMA_MODEL", raising=False)
+
+    with patch(
+        "reporescue.agent_runtime.check_ollama_alive", return_value=True
+    ) as mock_alive:
+        with pytest.raises(
+            RuntimeConfigurationError, match="Real AI runtime requested"
+        ):
+            AgentRuntimeFactory.get_runtime("real")
+        mock_alive.assert_not_called()
