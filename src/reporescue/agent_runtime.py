@@ -91,16 +91,18 @@ ROLE_SCHEMA_INSTRUCTIONS: dict[str, str] = {
         '  "confidence": "low" | "medium" | "high"\n}'
     ),
     "reproducer": (
+        "Carefully inspect `repository_files` in the context! Write a minimal, deterministic pytest test that imports from the actual package shown in repository_files (e.g. `from shop.checkout import calculate_order_total`) and reproduces the reported bug failure when executed.\n"
         "Respond with a single JSON object containing:\n"
-        '{\n  "test_file": "tests/test_reproduce_<bug>.py",\n'
-        '  "test_code": "import pytest\\n\\ndef test_reproduce_...():\\n    ...",\n'
+        '{\n  "test_file": "tests/test_reproduce_coupon_500.py",\n'
+        '  "test_code": "from shop.checkout import calculate_order_total\\n\\ndef test_reproduce_expired_coupon_500():\\n    items = [{\\"price\\": 100.0, \\"quantity\\": 1}]\\n    total = calculate_order_total(items, coupon_code=\\"EXPIRED\\")\\n    assert total == 100.0\\n",\n'
         '  "failure_evidence": "description of expected failure output"\n}'
     ),
     "fixer": (
+        "Carefully inspect `repository_files` and `reproduction_evidence` in the context! Provide the complete updated file content of the actual module in repository_files (e.g. `src/shop/checkout.py`) to fix the bug without breaking existing tests.\n"
         "Respond with a single JSON object containing:\n"
-        '{\n  "changed_files": ["relative/path/to/file.py", ...],\n'
+        '{\n  "changed_files": ["src/shop/checkout.py"],\n'
         '  "file_contents": {\n'
-        '    "relative/path/to/file.py": "full content of fixed file"\n'
+        '    "src/shop/checkout.py": "... complete fixed file content ..."\n'
         "  },\n"
         '  "rationale": "one-sentence rationale for the fix"\n}'
     ),
@@ -130,7 +132,7 @@ def extract_json_payload(raw_text: str) -> dict[str, Any]:
 
     # 1. Direct JSON parse
     try:
-        data = json.loads(text)
+        data = json.loads(text, strict=False)
         if isinstance(data, dict):
             return data
     except json.JSONDecodeError:
@@ -140,7 +142,7 @@ def extract_json_payload(raw_text: str) -> dict[str, Any]:
     code_block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if code_block_match:
         try:
-            data = json.loads(code_block_match.group(1))
+            data = json.loads(code_block_match.group(1), strict=False)
             if isinstance(data, dict):
                 return data
         except json.JSONDecodeError:
@@ -152,7 +154,7 @@ def extract_json_payload(raw_text: str) -> dict[str, Any]:
     if first_brace != -1 and last_brace > first_brace:
         candidate = text[first_brace : last_brace + 1]
         try:
-            data = json.loads(candidate)
+            data = json.loads(candidate, strict=False)
             if isinstance(data, dict):
                 return data
         except json.JSONDecodeError:
@@ -244,6 +246,7 @@ class MockAgentRuntime:
 
     def __init__(self, runtime_name: str = "mock-deterministic") -> None:
         self.runtime_name = runtime_name
+        self.is_simulation = True
         self.custom_responses: dict[str, dict[str, Any]] = {}
 
     def set_custom_response(self, role: str, data: dict[str, Any]) -> None:
@@ -409,6 +412,7 @@ class OpenAICompatibleRuntime:
         )
         self.timeout_seconds = timeout_seconds
         self.runtime_name = runtime_name or f"openai/{self.model}"
+        self.is_simulation = False
         self.http_handler = http_handler
 
     def run_agent(self, request: AgentRequest) -> AgentResult:
@@ -495,6 +499,16 @@ class OpenAICompatibleRuntime:
         )
 
 
+def check_ollama_alive(url: str = "http://127.0.0.1:11434") -> bool:
+    """Checks whether local Ollama daemon is reachable."""
+    try:
+        req = urllib.request.Request(f"{url}/api/version", method="GET")
+        with urllib.request.urlopen(req, timeout=0.8) as resp:
+            return resp.status == 200
+    except OSError:
+        return False
+
+
 class AgentRuntimeFactory:
     """Factory to provision agent runtimes depending on environment configuration."""
 
@@ -505,14 +519,14 @@ class AgentRuntimeFactory:
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float = 120.0,
     ) -> AgentRuntimeProtocol:
         """Returns the appropriate runtime.
 
         Preference options:
         - "mock": Deterministic MockAgentRuntime (is_simulation=True)
-        - "real": OpenAICompatibleRuntime (is_simulation=False); raises RuntimeConfigurationError if not configured
-        - None: Auto-detect. Uses real provider if OPENAI_API_KEY / LLM_API_KEY / OPENAI_BASE_URL is present, else mock.
+        - "real": OpenAICompatibleRuntime (is_simulation=False); connects to OpenAI, cloud LLM, or local Ollama
+        - None: Auto-detect. Uses real provider if OPENAI_API_KEY / LLM_API_KEY / OPENAI_BASE_URL is set, or local Ollama is active.
         """
         force_mock = os.getenv("REPORESCUE_FORCE_MOCK", "").lower() in (
             "1",
@@ -527,30 +541,59 @@ class AgentRuntimeFactory:
             base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL")
         )
 
+        # Check if local Ollama daemon is active if no custom url was specified
+        ollama_active = False
+        target_model = model
+        if not key and not custom_url:
+            ollama_url = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+            if check_ollama_alive(ollama_url):
+                ollama_active = True
+                custom_url = f"{ollama_url}/v1"
+                target_model = (
+                    model
+                    or os.getenv("OLLAMA_MODEL")
+                    or os.getenv("OPENAI_MODEL")
+                    or "qwen3:8b"
+                )
+
         if preference == "real":
-            if not key and not custom_url:
+            if not key and not custom_url and not ollama_active:
                 raise RuntimeConfigurationError(
                     "Real AI runtime requested, but neither OPENAI_API_KEY (or LLM_API_KEY) "
-                    "nor OPENAI_BASE_URL (or LLM_BASE_URL) is configured in environment."
+                    "nor OPENAI_BASE_URL (or LLM_BASE_URL) is configured, and no local Ollama "
+                    "instance was detected on http://127.0.0.1:11434."
                 )
-            logger.info("Initializing real AI agent runtime (OpenAI-compatible)")
+            rt_label = (
+                f"ollama/{target_model}"
+                if ollama_active
+                else f"openai/{target_model or 'gpt-4o-mini'}"
+            )
+            logger.info("Initializing real AI agent runtime: %s", rt_label)
             return OpenAICompatibleRuntime(
                 api_key=key,
                 base_url=custom_url,
-                model=model,
+                model=target_model,
                 timeout_seconds=timeout_seconds,
+                runtime_name=rt_label,
             )
 
-        # Auto-detect: if credentials are provided in env, use real provider
-        if key or custom_url:
+        # Auto-detect: if credentials or active local Ollama are detected, use real provider
+        if key or custom_url or ollama_active:
+            rt_label = (
+                f"ollama/{target_model}"
+                if ollama_active
+                else f"openai/{target_model or 'gpt-4o-mini'}"
+            )
             logger.info(
-                "AI provider credentials detected. Using real OpenAI-compatible runtime."
+                "Active AI provider detected (%s). Using real AI runtime.",
+                rt_label,
             )
             return OpenAICompatibleRuntime(
                 api_key=key,
                 base_url=custom_url,
-                model=model,
+                model=target_model,
                 timeout_seconds=timeout_seconds,
+                runtime_name=rt_label,
             )
 
         logger.info(

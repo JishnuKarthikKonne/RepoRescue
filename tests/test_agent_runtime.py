@@ -241,6 +241,22 @@ def test_validate_safe_worktree_file_path_traversal(tmp_path: Path):
         validate_safe_worktree_file(wt_path, "src/../../outside.py")
 
 
+def test_validate_safe_worktree_file_symlink_escape(tmp_path: Path):
+    wt_path = tmp_path / "worktree"
+    wt_path.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+
+    symlink_dir = wt_path / "leak_link"
+    try:
+        symlink_dir.symlink_to(outside_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlink creation requires elevated permissions on this OS")
+
+    with pytest.raises(FixerSafetyError, match="escapes worktree boundary"):
+        validate_safe_worktree_file(wt_path, "leak_link/secret.txt")
+
+
 def test_validate_safe_worktree_file_absolute_path(tmp_path: Path):
     wt_path = tmp_path / "worktree"
     wt_path.mkdir()

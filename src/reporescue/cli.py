@@ -71,11 +71,13 @@ def run_listener(
     )
 
     if mock or demo:
-        logger.info("Initializing RepoRescue in MOCK mode (offline demonstration)")
+        logger.info(
+            "Switch Transport: MockSwitchClient (offline simulated Switch events)"
+        )
         client = MockSwitchClient(cfg)
     else:
         logger.info(
-            "Connecting to Switch Agent Bridge at %s (agent=%s)",
+            "Switch Transport: Connecting to live Switch Agent Bridge at %s (agent=%s)",
             cfg.server_url,
             cfg.agent_id,
         )
@@ -230,10 +232,10 @@ def main() -> None:
 
     runtime_mode = "real" if args.real else args.runtime
 
-    if args.listen or args.mock or args.demo:
+    if args.listen or args.mock or args.demo or args.real:
         run_listener(
-            mock=args.mock,
-            demo=args.demo,
+            mock=args.mock or (not args.listen),
+            demo=args.demo or args.real,
             runtime_mode=runtime_mode,
             room_id=args.room_id,
             poll_interval=args.poll_interval,

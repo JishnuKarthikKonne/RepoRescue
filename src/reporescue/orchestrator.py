@@ -78,6 +78,17 @@ def validate_safe_worktree_file(worktree_path: Path, relative_path: str) -> Path
     if not target.is_relative_to(wt_resolved) or target == wt_resolved:
         raise FixerSafetyError(f"Path escapes worktree boundary: {relative_path}")
 
+    # Check for symlink escape: if path is a symlink or parent is symlink pointing outside
+    if target.is_symlink() or any(p.is_symlink() for p in target.parents):
+        try:
+            resolved_link = target.resolve(strict=False)
+            if not resolved_link.is_relative_to(wt_resolved):
+                raise FixerSafetyError(
+                    f"Symlink escapes worktree boundary: {relative_path}"
+                )
+        except OSError as err:
+            raise FixerSafetyError(f"Invalid symlink path: {relative_path}") from err
+
     # Check protected directories / files
     rel_parts = target.relative_to(wt_resolved).parts
     if any(part in PROTECTED_ROOT_DIRS for part in rel_parts):
@@ -91,6 +102,42 @@ def validate_safe_worktree_file(worktree_path: Path, relative_path: str) -> Path
         )
 
     return target
+
+
+def collect_repo_files(
+    root: Path, max_files: int = 15, max_bytes: int = 10000
+) -> dict[str, str]:
+    """Collects relative file paths and text contents from repo/worktree for agent context."""
+    files: dict[str, str] = {}
+    if not root.exists():
+        return files
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root).as_posix()
+        if any(
+            part
+            in (
+                ".git",
+                ".reporescue",
+                ".venv",
+                "__pycache__",
+                ".pytest_cache",
+                ".ruff_cache",
+                "build",
+                "dist",
+            )
+            for part in p.parts
+        ):
+            continue
+        if p.suffix in (".py", ".toml", ".md", ".txt"):
+            try:
+                files[rel] = p.read_text(encoding="utf-8", errors="replace")[:max_bytes]
+            except OSError:
+                pass
+        if len(files) >= max_files:
+            break
+    return files
 
 
 class WorkflowOrchestrator:
@@ -202,6 +249,7 @@ class WorkflowOrchestrator:
                     "affected_components": triage_res.affected_components,
                 },
                 "repo_path": str(self.repo_path),
+                "repository_files": collect_repo_files(self.repo_path),
             },
             prompt_instruction=prompt,
         )
@@ -261,6 +309,7 @@ class WorkflowOrchestrator:
                 "affected_files": invest_res.affected_files,
                 "reproduction_strategy": invest_res.reproduction_strategy,
                 "worktree_path": str(wt.path),
+                "repository_files": collect_repo_files(wt.path),
             },
             prompt_instruction=prompt,
         )
@@ -339,6 +388,7 @@ class WorkflowOrchestrator:
                 "reproduction_evidence": repro_res.failure_evidence,
                 "branch_name": wt.branch,
                 "worktree_path": str(wt.path),
+                "repository_files": collect_repo_files(wt.path),
             },
             prompt_instruction=prompt,
         )
@@ -367,6 +417,14 @@ class WorkflowOrchestrator:
             if diff_res.stdout.strip()
             else raw.get("diff", "--- a/file\n+++ b/file\n")
         )
+
+        # Commit fix to the isolated branch
+        if real_diff:
+            run_command(["git", "add", "."], cwd=wt.path)
+            run_command(
+                ["git", "commit", "-m", f"fix: {rationale}"],
+                cwd=wt.path,
+            )
 
         fix_res = FixResult(
             changed_files=changed_files,
