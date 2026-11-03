@@ -285,6 +285,26 @@ class GitHubPRManager:
                 "Cannot push branch: repository is not configured."
             )
 
+        wt_origin = detect_repository_origin(worktree_path)
+        if (
+            wt_origin
+            and self.config.repository
+            and wt_origin.lower() != self.config.repository.lower()
+        ):
+            raise SafetyGateViolationError(
+                f"Repository Identity Mismatch: Worktree remote origin '{wt_origin}' "
+                f"does not match target repository '{self.config.repository}'."
+            )
+
+        if not branch_name.startswith("reporescue/task-") or branch_name in (
+            "main",
+            "master",
+        ):
+            raise SafetyGateViolationError(
+                f"Safety Invariant Violation: Refusing to push non-task branch '{branch_name}'. "
+                f"Branch must start with 'reporescue/task-' and must not be main."
+            )
+
         remote_url = f"https://github.com/{self.config.repository}.git"
         push_cmd = ["git", "push", "-u", remote_url, f"{branch_name}:{branch_name}"]
 
@@ -295,9 +315,8 @@ class GitHubPRManager:
         }
 
         if self.config.token:
-            # Explicit token: Git Smart HTTP Basic Auth (x-access-token:<token>)
-            # Explicitly clear credential.helper so Git NEVER falls back to GCM or another account
-            auth_bytes = f"x-access-token:{self.config.token}".encode()
+            user = self.config.token_username or "x-access-token"
+            auth_bytes = f"{user}:{self.config.token}".encode()
             basic_auth = base64.b64encode(auth_bytes).decode("ascii")
             push_env["GIT_CONFIG_PARAMETERS"] = (
                 f"'credential.helper=' 'http.extraHeader=Authorization: Basic {basic_auth}'"

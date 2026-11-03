@@ -13,6 +13,8 @@ from reporescue.switch.client import (
     SwitchClient,
     SwitchConfig,
     SwitchError,
+    SwitchMembershipError,
+    SwitchRoomNotFoundError,
 )
 from reporescue.switch.dispatcher import RepoRescueDispatcher
 from reporescue.switch.models import SwitchMessageEvent
@@ -876,3 +878,127 @@ def test_dispatcher_room_id_filtering():
     res = dispatcher.handle_message_event(other_room_evt)
     assert res is None
     assert len(dispatcher.tasks) == 0
+
+
+def test_switch_client_check_health_success():
+    cfg = SwitchConfig(server_url="http://switch.local:65008")
+    client = SwitchClient(cfg)
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(
+        {"status": "ok", "version": "0.31.0"}
+    ).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        assert client.check_health() is True
+
+
+def test_switch_client_check_health_failure():
+    cfg = SwitchConfig(server_url="http://switch.local:65008")
+    client = SwitchClient(cfg)
+
+    with patch(
+        "urllib.request.urlopen",
+        side_effect=urllib.error.URLError("Connection refused"),
+    ):
+        assert client.check_health() is False
+
+
+def test_switch_client_resolve_and_verify_room_existing():
+    cfg = SwitchConfig(
+        server_url="http://switch.local:65008", agent_id="agent_123", api_key="secret"
+    )
+    client = SwitchClient(cfg)
+
+    with (
+        patch.object(
+            client, "list_rooms", return_value=[{"id": "room_abc", "name": "General"}]
+        ),
+        patch.object(client, "get_room_history", return_value={"events": []}),
+    ):
+        room_id, room_name = client.resolve_and_verify_room("room_abc")
+        assert room_id == "room_abc"
+        assert room_name == "General"
+
+
+def test_switch_client_resolve_and_verify_room_discovery_without_specified_id():
+    cfg = SwitchConfig(
+        server_url="http://switch.local:65008", agent_id="agent_123", api_key="secret"
+    )
+    client = SwitchClient(cfg)
+
+    with (
+        patch.object(
+            client,
+            "list_rooms",
+            return_value=[{"id": "room_discovered", "name": "General"}],
+        ),
+        patch.object(client, "get_room_history", return_value={"events": []}),
+    ):
+        room_id, room_name = client.resolve_and_verify_room(None)
+        assert room_id == "room_discovered"
+        assert room_name == "General"
+
+
+def test_switch_client_resolve_and_verify_room_auto_create():
+    cfg = SwitchConfig(
+        server_url="http://switch.local:65008", agent_id="agent_123", api_key="secret"
+    )
+    client = SwitchClient(cfg)
+
+    with (
+        patch.object(client, "list_rooms", return_value=[]),
+        patch.object(
+            client, "get_room_detail", side_effect=SwitchRoomNotFoundError("Not found")
+        ),
+        patch.object(
+            client,
+            "create_room",
+            return_value={"id": "room_new", "name": "RepoRescue Triage"},
+        ),
+        patch.object(client, "get_room_history", return_value={"events": []}),
+    ):
+        room_id, room_name = client.resolve_and_verify_room(
+            "nonexistent_room", auto_create=True
+        )
+        assert room_id == "room_new"
+        assert room_name == "RepoRescue Triage"
+
+
+def test_switch_client_resolve_and_verify_room_not_found_raises():
+    cfg = SwitchConfig(
+        server_url="http://switch.local:65008", agent_id="agent_123", api_key="secret"
+    )
+    client = SwitchClient(cfg)
+
+    with (
+        patch.object(client, "list_rooms", return_value=[]),
+        patch.object(
+            client, "get_room_detail", side_effect=SwitchRoomNotFoundError("Not found")
+        ),
+        pytest.raises(
+            SwitchRoomNotFoundError, match="Room 'missing_room' does not exist"
+        ),
+    ):
+        client.resolve_and_verify_room("missing_room", auto_create=False)
+
+
+def test_switch_client_resolve_and_verify_room_membership_error():
+    cfg = SwitchConfig(
+        server_url="http://switch.local:65008", agent_id="agent_123", api_key="secret"
+    )
+    client = SwitchClient(cfg)
+
+    with (
+        patch.object(
+            client,
+            "list_rooms",
+            return_value=[{"id": "room_restricted", "name": "Restricted"}],
+        ),
+        patch.object(
+            client, "get_room_history", side_effect=SwitchAuthError("Forbidden")
+        ),
+        pytest.raises(SwitchMembershipError, match="lacks membership or access"),
+    ):
+        client.resolve_and_verify_room("room_restricted", auto_create=False)

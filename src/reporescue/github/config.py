@@ -119,6 +119,8 @@ class GitHubConfig:
     orchestrator_repository: str | None = None
     token_source: str | None = None
     token_username: str | None = None
+    source_repository_path: Path | None = None
+    source_repository_origin: str | None = None
 
     @classmethod
     def from_env(
@@ -173,7 +175,27 @@ class GitHubConfig:
         demo_detected = (
             is_demo if is_demo is not None else is_demo_repository(repo_path)
         )
-        orchestrator_repo = get_orchestrator_repository(repo_path)
+        target_path: Path | None = Path(repo_path).resolve() if repo_path else None
+        source_origin: str | None = None
+        orchestrator_repo: str | None = None
+
+        if target_path is not None:
+            source_origin = detect_repository_origin(target_path)
+            orchestrator_repo = get_orchestrator_repository(target_path)
+        else:
+            # When repo_path is not explicitly provided, check if GITHUB_REPOSITORY is unset
+            env_repo_check = (
+                os.getenv("GITHUB_REPOSITORY", "").strip()
+                or os.getenv("REPORESCUE_GITHUB_REPO", "").strip()
+                or None
+            )
+            if not env_repo_check and not demo_detected:
+                cwd_path = Path.cwd().resolve()
+                cwd_origin = detect_repository_origin(cwd_path)
+                if cwd_origin:
+                    target_path = cwd_path
+                    source_origin = cwd_origin
+                    orchestrator_repo = get_orchestrator_repository(cwd_path)
 
         repository: str | None = None
         if demo_detected:
@@ -181,8 +203,8 @@ class GitHubConfig:
             demo_env_repo = os.getenv("DEMO_GITHUB_REPOSITORY", "").strip() or None
             if demo_env_repo:
                 repository = demo_env_repo
-            elif repo_path:
-                repository = detect_repository_origin(repo_path)
+            else:
+                repository = source_origin
             # Never inherit parent orchestrator repo for demo
         else:
             # Standard task: GITHUB_REPOSITORY or local git remote origin
@@ -193,8 +215,8 @@ class GitHubConfig:
             )
             if env_repo:
                 repository = env_repo
-            elif repo_path:
-                repository = detect_repository_origin(repo_path)
+            else:
+                repository = source_origin
 
         return cls(
             token=token,
@@ -208,6 +230,8 @@ class GitHubConfig:
             orchestrator_repository=orchestrator_repo,
             token_source=token_source,
             token_username=token_username,
+            source_repository_path=target_path,
+            source_repository_origin=source_origin,
         )
 
     @property
@@ -265,6 +289,15 @@ class GitHubConfig:
                     f"Repository Isolation Violation: Demo repository patches cannot be published "
                     f"to the RepoRescue orchestrator repository ('{self.repository}'). "
                     f"Set DEMO_GITHUB_REPOSITORY to an independent demo repository target."
+                )
+            if (
+                not self.is_demo
+                and self.source_repository_origin
+                and self.source_repository_origin.lower() != self.repository.lower()
+            ):
+                errors.append(
+                    f"Repository Identity Mismatch: Local git remote origin '{self.source_repository_origin}' "
+                    f"does not match configured target GitHub repository '{self.repository}'."
                 )
             if self.repository_allowlist:
                 # Check allowlist compliance

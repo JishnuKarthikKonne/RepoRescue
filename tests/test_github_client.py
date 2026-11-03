@@ -176,3 +176,106 @@ def test_mock_github_client_lifecycle():
     )
     with pytest.raises(GitHubValidationError):
         client.create_draft_pr(bad_req)
+
+
+def test_preflight_git_receive_pack_http_success(tmp_path):
+    cfg = GitHubConfig(
+        token="ghp_test_token",
+        repository="owner/repo",
+        token_username="testuser",
+        source_repository_path=tmp_path,
+    )
+    client = GitHubClient(cfg)
+
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.getcode.return_value = 200
+    mock_resp.headers = {"Content-Type": "application/x-git-receive-pack-advertisement"}
+    mock_resp.read.return_value = b"001e# service=git-receive-pack\n0000"
+    mock_resp.__enter__.return_value = mock_resp
+
+    with (
+        patch.object(
+            client, "check_auth_and_repo", return_value={"permissions": {"push": True}}
+        ),
+        patch.object(client, "_make_request", return_value={"login": "testuser"}),
+        patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen,
+    ):
+        res = client.preflight_git_receive_pack()
+        assert res.api_authenticated is True
+        assert res.api_push_permission is True
+        assert res.git_smart_http_authorized is True
+        assert res.status_code == 200
+        mock_urlopen.assert_called_once()
+        req = mock_urlopen.call_args[0][0]
+        assert "git-receive-pack" in req.get_full_url()
+
+
+def test_preflight_git_receive_pack_http_403_denied():
+    cfg = GitHubConfig(
+        token="ghp_readonly_token",
+        repository="owner/repo",
+        token_username="testuser",
+    )
+    client = GitHubClient(cfg)
+
+    http_error = urllib.error.HTTPError(
+        url="https://github.com/owner/repo.git/info/refs?service=git-receive-pack",
+        code=403,
+        msg="Forbidden",
+        hdrs={},
+        fp=MagicMock(read=lambda: b"Permission denied to push"),
+    )
+
+    with (
+        patch.object(
+            client, "check_auth_and_repo", return_value={"permissions": {"push": True}}
+        ),
+        patch.object(client, "_make_request", return_value={"login": "testuser"}),
+        patch("urllib.request.urlopen", side_effect=http_error),
+    ):
+        res = client.preflight_git_receive_pack()
+        assert res.api_authenticated is True
+        assert res.api_push_permission is True  # REST API reports True
+        assert res.git_smart_http_authorized is False  # But Git push fails with 403!
+        assert res.status_code == 403
+        assert "403" in res.error_message
+
+
+def test_preflight_git_receive_pack_dry_run_fails_with_permission_denied(tmp_path):
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+
+    cfg = GitHubConfig(
+        token="ghp_test_token",
+        repository="owner/repo",
+        token_username="testuser",
+        source_repository_path=tmp_path,
+    )
+    client = GitHubClient(cfg)
+
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.getcode.return_value = 200
+    mock_resp.headers = {"Content-Type": "application/x-git-receive-pack-advertisement"}
+    mock_resp.read.return_value = b"001e# service=git-receive-pack\n0000"
+    mock_resp.__enter__.return_value = mock_resp
+
+    with (
+        patch.object(
+            client, "check_auth_and_repo", return_value={"permissions": {"push": True}}
+        ),
+        patch.object(client, "_make_request", return_value={"login": "testuser"}),
+        patch("urllib.request.urlopen", return_value=mock_resp),
+        patch("reporescue.runner.run_command") as mock_run_cmd,
+    ):
+        mock_run_cmd.return_value = MagicMock(
+            passed=False,
+            stderr="fatal: remote: Permission to owner/repo.git denied to testuser.",
+            stdout="",
+        )
+        res = client.preflight_git_receive_pack()
+        assert res.api_authenticated is True
+        assert res.git_smart_http_authorized is False
+        assert res.status_code == 403
+        assert "Permission to owner/repo.git denied to testuser" in res.error_message

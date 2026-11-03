@@ -4,7 +4,13 @@ import logging
 import threading
 from typing import Self
 
-from .client import SwitchAuthError, SwitchClientProtocol, SwitchError
+from .client import (
+    SwitchAuthError,
+    SwitchClientProtocol,
+    SwitchError,
+    SwitchMembershipError,
+    SwitchRoomNotFoundError,
+)
 from .dispatcher import RepoRescueDispatcher
 
 logger = logging.getLogger("reporescue.switch.listener")
@@ -127,16 +133,41 @@ class SwitchListener:
                         self._last_heartbeat_time = now
 
                 except SwitchAuthError as err:
-                    self._consecutive_errors += 1
                     logger.error(
-                        "Authentication error contacting Switch server: %s", err
+                        "Permanent authentication error contacting Switch server: %s. Stopping listener.",
+                        err,
                     )
-                    self._apply_backoff()
+                    self.stop()
+                    break
+
+                except SwitchRoomNotFoundError as err:
+                    logger.error(
+                        "Permanent room error: Room '%s' not found on Switch server: %s. Stopping listener.",
+                        self.room_id,
+                        err,
+                    )
+                    self.stop()
+                    break
+
+                except SwitchMembershipError as err:
+                    logger.error(
+                        "Permanent membership error: Agent lacks access to room '%s': %s. Stopping listener.",
+                        self.room_id,
+                        err,
+                    )
+                    self.stop()
+                    break
 
                 except SwitchError as err:
                     self._consecutive_errors += 1
+                    if self._consecutive_errors >= 10:
+                        logger.error(
+                            "Exceeded maximum consecutive network retry attempts (10). Stopping listener."
+                        )
+                        self.stop()
+                        break
                     logger.warning(
-                        "Network error connecting to Switch (attempt %d): %s. Retrying in %.1fs...",
+                        "Transient network error connecting to Switch (attempt %d/10): %s. Retrying in %.1fs...",
                         self._consecutive_errors,
                         err,
                         self._current_delay,
@@ -145,7 +176,16 @@ class SwitchListener:
 
                 except Exception:
                     self._consecutive_errors += 1
-                    logger.exception("Unexpected error in Switch poll loop")
+                    if self._consecutive_errors >= 10:
+                        logger.exception(
+                            "Exceeded maximum consecutive error threshold (10). Stopping listener."
+                        )
+                        self.stop()
+                        break
+                    logger.exception(
+                        "Unexpected error in Switch poll loop (attempt %d/10)",
+                        self._consecutive_errors,
+                    )
                     self._apply_backoff()
 
                 # Interruptible sleep
@@ -162,10 +202,13 @@ class SwitchListener:
             logger.info("RepoRescue Switch listener stopped gracefully.")
 
     def _apply_backoff(self) -> None:
-        """Calculates exponential backoff delay capped at max_backoff."""
+        """Calculates exponential backoff delay with jitter capped at max_backoff."""
+        import random
+
+        jitter = random.uniform(0.85, 1.15)
         self._current_delay = min(
             self.max_backoff,
-            self._current_delay * self.backoff_multiplier,
+            self._current_delay * self.backoff_multiplier * jitter,
         )
 
     def stop(self) -> None:

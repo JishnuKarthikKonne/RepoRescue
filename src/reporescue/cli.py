@@ -26,7 +26,14 @@ from .github.config import GitHubConfig, is_demo_repository
 from .github.manager import GitHubPRManager
 from .models import BugTask, TaskStatus
 from .orchestrator import WorkflowOrchestrator
-from .switch.client import MockSwitchClient, SwitchClient, SwitchConfig, SwitchError
+from .switch.client import (
+    MockSwitchClient,
+    SwitchClient,
+    SwitchConfig,
+    SwitchError,
+    SwitchMembershipError,
+    SwitchRoomNotFoundError,
+)
 from .switch.dispatcher import RepoRescueDispatcher
 from .switch.listener import SwitchListener
 from .switch.models import SwitchMessageEvent
@@ -48,8 +55,11 @@ def run_listener(
     repo_path: Path | str | None = None,
 ) -> None:
     """Runs the RepoRescue Switch listener in either live or mock mode."""
+    print("=" * 70)
+    print("  REPORESCUE: SWITCH AGENT LISTENER STARTUP")
+    print("=" * 70)
+
     cfg = SwitchConfig.from_env()
-    target_room = room_id or cfg.default_room_id or "!reporescue:localhost"
 
     # Setup demo repository if requested
     if demo:
@@ -102,18 +112,23 @@ def run_listener(
         is_sim,
     )
 
+    # 1. Switch Transport & Health Check
     if mock or demo:
-        logger.info(
-            "Switch Transport: MockSwitchClient (offline simulated Switch events)"
-        )
         client = MockSwitchClient(cfg)
+        print("Switch healthy:      ✅ MockSwitchClient (Offline simulation)")
+        print(f"Agent registered:    ✅ {client.config.agent_id}")
     else:
-        logger.info(
-            "Switch Transport: Connecting to live Switch Agent Bridge at %s (agent=%s)",
-            cfg.server_url,
-            cfg.agent_id,
-        )
         client = SwitchClient(cfg)
+        if not client.check_health():
+            logger.error(
+                "Cannot connect to Switch Core at %s. Please ensure Switch Core 0.31.0 is running on port 65008.",
+                cfg.server_url,
+            )
+            sys.exit(1)
+        print(f"Switch healthy:      ✅ {cfg.server_url} (Health: OK)", flush=True)
+        logger.info("Switch healthy: %s", cfg.server_url)
+
+        # 2. Auto-register agent if credentials missing
         if (
             not (client.config.agent_id and client.config.api_key)
             and client.config.registration_token
@@ -121,11 +136,50 @@ def run_listener(
             logger.info("Auto-registering RepoRescue agent with Switch server...")
             try:
                 agent_id, _ = client.register_agent(name="reporescue-agent")
-                logger.info("Successfully registered agent ID: %s", agent_id)
-            except (SwitchError, urllib.error.URLError, OSError) as err:
-                logger.warning("Could not auto-register agent: %s", err)
+                print(f"Agent registered:    ✅ {agent_id}", flush=True)
+                logger.info("Agent registered: %s", agent_id)
+            except (SwitchError, OSError) as err:
+                logger.error("Agent registration failed: %s", err)
+                sys.exit(1)
+        else:
+            print(f"Agent registered:    ✅ {client.config.agent_id}", flush=True)
+            logger.info("Agent registered: %s", client.config.agent_id)
 
-    dispatcher = RepoRescueDispatcher(client)
+    # 3, 4, 5, 6. Resolve Target Room & Verify Membership
+    raw_room_req = room_id or cfg.default_room_id or None
+    try:
+        resolved_room_id, resolved_room_name = client.resolve_and_verify_room(
+            raw_room_req, auto_create=True
+        )
+        target_room = resolved_room_id
+        print(
+            f"Room resolved:       ✅ {resolved_room_name} (ID: {resolved_room_id})",
+            flush=True,
+        )
+        print(
+            f"Membership verified: ✅ Agent '{client.config.agent_id}' has verified access",
+            flush=True,
+        )
+        print(
+            f"Listener active:     ✅ Polling room '{resolved_room_name}' ({resolved_room_id})",
+            flush=True,
+        )
+        logger.info(
+            "Target room resolved and verified: '%s' (%s)",
+            resolved_room_name,
+            resolved_room_id,
+        )
+    except SwitchRoomNotFoundError as err:
+        logger.error("Room resolution failed: %s", err)
+        sys.exit(1)
+    except SwitchMembershipError as err:
+        logger.error("Room membership verification failed: %s", err)
+        sys.exit(1)
+    except (SwitchError, OSError) as err:
+        logger.error("Unexpected error resolving room: %s", err)
+        sys.exit(1)
+
+    dispatcher = RepoRescueDispatcher(client, active_room_id=target_room)
     worktree_mgr = WorktreeManager(working_repo)
     orchestrator = WorkflowOrchestrator(
         repo_path=working_repo,
@@ -137,7 +191,7 @@ def run_listener(
     dispatcher.orchestrator = orchestrator
 
     # Attach GitHub PR Manager
-    gh_cfg = GitHubConfig.from_env(working_repo)
+    gh_cfg = GitHubConfig.from_env(working_repo, is_demo=demo)
     if mock or demo or gh_cfg.dry_run:
         if not gh_cfg.repository:
             gh_cfg.repository = "switch-hackathon/RepoRescue"
@@ -653,7 +707,17 @@ def run_github_check(repo_path: Path | str | None = None) -> None:
             print("\nReadiness: 🛑 NOT READY (REST API authentication failed).")
             return
 
-        print("\n[Stage 3: Git Smart HTTP Service Authorization (git-receive-pack)]")
+        print("\n[Stage 3: Git Smart HTTP Service Authorization & Push Preflight]")
+        cred_helper_desc = (
+            f"Windows Git Credential Manager (GCM) for user '{cfg.token_username}'"
+            if cfg.token_source == "gcm"
+            else (
+                "Explicit Token (Environment Variable)"
+                if cfg.token_source == "environment"
+                else "Dry Run / In-Memory"
+            )
+        )
+        print(f"  ✓ Credential Resolution: {cred_helper_desc}")
         if preflight.git_smart_http_authorized:
             print("  ✓ Git Smart HTTP Push Preflight: AUTHORIZED (HTTP 200)")
             print(

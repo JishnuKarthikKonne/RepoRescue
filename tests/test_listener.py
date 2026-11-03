@@ -6,7 +6,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from reporescue.switch.client import MockSwitchClient, SwitchAuthError, SwitchError
+from reporescue.switch.client import (
+    MockSwitchClient,
+    SwitchAuthError,
+    SwitchError,
+    SwitchMembershipError,
+    SwitchRoomNotFoundError,
+)
 from reporescue.switch.dispatcher import RepoRescueDispatcher
 from reporescue.switch.listener import SwitchListener
 from reporescue.switch.models import SwitchMessageEvent
@@ -111,11 +117,11 @@ def test_listener_reconnection_and_backoff():
     with pytest.raises(SwitchError):
         mock_client.poll_events()
     listener._apply_backoff()
-    assert listener._current_delay == 0.1
+    assert 0.08 <= listener._current_delay <= 0.12
 
     # Second poll: fails, increases backoff
     listener._apply_backoff()
-    assert listener._current_delay == 0.2
+    assert 0.16 <= listener._current_delay <= 0.25
 
 
 def test_listener_auth_error_handling():
@@ -125,6 +131,85 @@ def test_listener_auth_error_handling():
     dispatcher = MagicMock(spec=RepoRescueDispatcher)
     listener = SwitchListener(mock_client, dispatcher, poll_interval_seconds=0.05)
 
-    # Auth error should apply backoff safely without exposing secrets
-    listener._apply_backoff()
-    assert listener._current_delay > listener.poll_interval
+    # Auth error should stop the listener immediately in run_loop
+    listener.run_loop()
+    assert not listener.is_running
+
+
+def test_listener_404_room_not_found_stops_immediately():
+    """Verifies that HTTP 404 Room not found stops the listener loop immediately without infinite retries."""
+    mock_client = MagicMock()
+    mock_client.poll_events.side_effect = SwitchRoomNotFoundError(
+        "Room not found: !reporescue:localhost"
+    )
+
+    dispatcher = MagicMock(spec=RepoRescueDispatcher)
+    listener = SwitchListener(
+        mock_client,
+        dispatcher,
+        room_id="!reporescue:localhost",
+        poll_interval_seconds=0.01,
+    )
+
+    listener.run_loop()
+    assert not listener.is_running
+    # Must only have been called once before stopping
+    assert mock_client.poll_events.call_count == 1
+
+
+def test_listener_membership_error_stops_immediately():
+    """Verifies that SwitchMembershipError stops listener without endless retries."""
+    mock_client = MagicMock()
+    mock_client.poll_events.side_effect = SwitchMembershipError(
+        "Agent lacks membership"
+    )
+
+    dispatcher = MagicMock(spec=RepoRescueDispatcher)
+    listener = SwitchListener(
+        mock_client, dispatcher, room_id="room-x", poll_interval_seconds=0.01
+    )
+
+    listener.run_loop()
+    assert not listener.is_running
+    assert mock_client.poll_events.call_count == 1
+
+
+def test_listener_transient_failures_stop_after_max_retries():
+    """Verifies that transient errors retry up to 10 times then stop gracefully."""
+    mock_client = MagicMock()
+    mock_client.poll_events.side_effect = SwitchError("Transient connection drop")
+
+    dispatcher = MagicMock(spec=RepoRescueDispatcher)
+    listener = SwitchListener(
+        mock_client, dispatcher, room_id="room-t", poll_interval_seconds=0.001
+    )
+
+    listener.run_loop()
+    assert not listener.is_running
+    assert mock_client.poll_events.call_count == 10
+
+
+def test_mock_client_resolve_and_verify_room():
+    mock_client = MockSwitchClient()
+    mock_client.rooms = [{"id": "room-123", "name": "RepoRescue Bug Triage"}]
+
+    # 1. Matching existing room
+    room_id, room_name = mock_client.resolve_and_verify_room("RepoRescue Bug Triage")
+    assert room_id == "room-123"
+    assert room_name == "RepoRescue Bug Triage"
+
+    # 2. Room discovery when None requested
+    room_id, room_name = mock_client.resolve_and_verify_room(None)
+    assert room_id == "room-123"
+
+    # 3. Missing room with auto_create=False raises SwitchRoomNotFoundError
+    with pytest.raises(SwitchRoomNotFoundError):
+        mock_client.resolve_and_verify_room("non-existent-room", auto_create=False)
+
+    # 4. Missing room with auto_create=True creates room
+    room_id, room_name = mock_client.resolve_and_verify_room(
+        "new-triage-room", auto_create=True
+    )
+    assert room_id == "new-triage-room"
+    assert room_name == "new-triage-room"
+    assert any(r["id"] == "new-triage-room" for r in mock_client.rooms)

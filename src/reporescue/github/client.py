@@ -7,6 +7,7 @@ import logging
 import re
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Protocol
 
 from .config import GitHubConfig
@@ -202,10 +203,21 @@ class GitHubClient:
             "User-Agent": "git/2.43.0 (RepoRescue-Preflight)",
             "Accept": "application/x-git-receive-pack-advertisement",
         }
+        user = self.config.token_username or "x-access-token"
         if self.config.token:
-            auth_bytes = f"x-access-token:{self.config.token}".encode()
+            auth_bytes = f"{user}:{self.config.token}".encode()
             basic_auth = base64.b64encode(auth_bytes).decode("ascii")
             headers["Authorization"] = f"Basic {basic_auth}"
+
+        guidance = (
+            "Root Cause: The configured GitHub token lacks Git write authorization for this repository.\n"
+            "  • Fine-Grained Personal Access Token:\n"
+            "    Verify 'Repository permissions' -> 'Contents' is set to 'Read and write'.\n"
+            "  • Classic Personal Access Token:\n"
+            "    Verify the 'repo' scope is enabled (Full control of private repositories).\n"
+            "  • Organization / SAML Single Sign-On:\n"
+            "    Verify the token is authorized for SAML SSO in your organization."
+        )
 
         req = urllib.request.Request(repo_url, headers=headers, method="GET")
         try:
@@ -217,6 +229,49 @@ class GitHubClient:
                 if resp.status == 200 and (
                     "git-receive-pack" in body or "git-receive-pack" in content_type
                 ):
+                    target_repo = self.config.source_repository_path or Path.cwd()
+                    if (target_repo / ".git").exists() and not self.config.dry_run:
+                        from ..runner import run_command
+
+                        test_env = {
+                            "GIT_TERMINAL_PROMPT": "0",
+                            "GCM_INTERACTIVE": "never",
+                        }
+                        if self.config.token:
+                            test_env["GIT_CONFIG_PARAMETERS"] = (
+                                f"'credential.helper=' 'http.extraHeader=Authorization: Basic {basic_auth}'"
+                            )
+                            test_env["GITHUB_TOKEN"] = self.config.token
+                            test_env["GH_TOKEN"] = self.config.token
+                        dry_res = run_command(
+                            [
+                                "git",
+                                "push",
+                                "--dry-run",
+                                f"https://github.com/{self.config.repository}.git",
+                                "HEAD:refs/heads/reporescue-preflight-test",
+                            ],
+                            cwd=target_repo,
+                            env=test_env,
+                            timeout_seconds=15.0,
+                        )
+                        if not dry_res.passed and any(
+                            x in dry_res.stderr.lower()
+                            for x in ("403", "denied", "permission", "unauthorized")
+                        ):
+                            sanitized = _sanitize_message(
+                                dry_res.stderr, self.config.token
+                            )
+                            return GitPushPreflightResult(
+                                api_authenticated=True,
+                                api_username=api_username,
+                                api_push_permission=api_push,
+                                git_smart_http_authorized=False,
+                                status_code=403,
+                                error_message=f"Git push subprocess denied (HTTP 403): {sanitized.strip()}",
+                                diagnostic_guidance=guidance,
+                            )
+
                     return GitPushPreflightResult(
                         api_authenticated=True,
                         api_username=api_username,
