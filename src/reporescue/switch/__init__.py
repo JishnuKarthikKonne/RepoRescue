@@ -9,6 +9,7 @@ from .client import (
     SwitchError,
 )
 from .dispatcher import RepoRescueDispatcher
+from .listener import SwitchListener
 from .models import SwitchMessageEvent, WorkflowFormatter
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "SwitchClientProtocol",
     "SwitchConfig",
     "SwitchError",
+    "SwitchListener",
     "SwitchMessageEvent",
     "WorkflowFormatter",
 ]

@@ -18,7 +18,39 @@ class SwitchMessageEvent:
     addressed: bool = True
     thread_id: str | None = None
     channel_type: str | None = None
+    sender_kind: str | None = None
+    on_behalf_of: str | None = None
+    sender_role: str | None = None
     raw_payload: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @property
+    def is_human_sender(self) -> bool:
+        """Determines if the message originated from a verified human teammate.
+
+        Strictly rejects automated agents, bots, or unverified automated messages.
+        """
+        if not self.sender_name or not self.sender_name.strip():
+            return False
+
+        # Switch protocol explicit sender_kind: 'user', 'agent', 'platform'
+        if self.sender_kind in ("agent", "bot"):
+            return False
+
+        if self.sender_kind == "platform":
+            # Platform message only allowed if explicitly sent on behalf of a human
+            return bool(self.on_behalf_of and self.on_behalf_of.strip())
+
+        # Check sender URI / identifier
+        lower_sender = self.sender.lower().strip()
+        if lower_sender.startswith(("agent:", "bot:", "switch:", "system:")):
+            return False
+
+        # Check display name
+        lower_name = self.sender_name.lower().strip()
+        return not (
+            lower_name in ("reporescue", "switch", "system")
+            or lower_name.endswith("bot")
+        )
 
     @classmethod
     def from_agent_event(cls, data: dict[str, Any]) -> SwitchMessageEvent | None:
@@ -40,10 +72,12 @@ class SwitchMessageEvent:
             return None
 
         sender = payload.get("sender", "unknown")
+        sender_kind = payload.get("sender_kind")
+        on_behalf_of = payload.get("on_behalf_of")
+        sender_role = payload.get("sender_role")
+
         # Switch populates on_behalf_of or sender_name when proxying via Mattermost/Slack
-        sender_name = (
-            payload.get("on_behalf_of") or payload.get("sender_name") or sender
-        )
+        sender_name = on_behalf_of or payload.get("sender_name") or sender
         message_id = payload.get("message_id") or str(payload.get("timestamp", ""))
 
         raw_ts = payload.get("timestamp")
@@ -63,6 +97,9 @@ class SwitchMessageEvent:
             addressed=bool(payload.get("addressed", True)),
             thread_id=payload.get("thread_id"),
             channel_type=channel_type,
+            sender_kind=sender_kind,
+            on_behalf_of=on_behalf_of,
+            sender_role=sender_role,
             raw_payload=data,
         )
 
@@ -132,10 +169,13 @@ class WorkflowFormatter:
         )
 
     @staticmethod
-    def format_approval_confirmation(task_id: str, approver: str) -> str:
+    def format_approval_confirmation(
+        task_id: str, approver: str, timestamp: datetime | None = None
+    ) -> str:
+        ts_str = f" at `{timestamp.isoformat()}`" if timestamp else ""
         return (
             f"### 👤 Human Approval Granted\n\n"
             f"**Task ID:** `{task_id}`\n"
-            f"**Approved By:** @{approver}\n"
+            f"**Approved By:** @{approver}{ts_str}\n"
             f"**Next Step:** Ready to open Pull Request with full reproduction and verification evidence."
         )

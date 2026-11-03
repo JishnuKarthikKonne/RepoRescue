@@ -66,6 +66,15 @@ class RepoRescueDispatcher:
 
     def _handle_approval(self, event: SwitchMessageEvent) -> BugTask | None:
         """Handles human /approve command in the Switch room."""
+        # Task 3 Hardening: Reject approvals from Switch agents, bots, or unverified automated sources
+        if not event.is_human_sender:
+            warn_msg = (
+                f"⚠️ Approval rejected: Approvals must be submitted by a verified human teammate, "
+                f"not an automated agent or bot (received from '@{event.sender_name}' [kind={event.sender_kind or 'unknown'}])."
+            )
+            self.client.send_message(event.room_id, warn_msg)
+            return None
+
         task_id = self._resolve_target_task_id(event)
         if not task_id or task_id not in self.tasks:
             self.client.send_message(
@@ -78,14 +87,17 @@ class RepoRescueDispatcher:
         if task.status != TaskStatus.AWAITING_APPROVAL:
             self.client.send_message(
                 event.room_id,
-                f"⚠️ Task `{task.task_id}` is in state `{task.status}`, not `awaiting_approval`.",
+                f"⚠️ Approval rejected: Task `{task.task_id}` is in state `{task.status}`, not `awaiting_approval`. "
+                f"Mandatory verification tests must pass before approval can be granted.",
             )
             return task
 
-        # Enforce human actor in state machine
-        task.transition(TaskStatus.APPROVED, actor=event.sender_name)
+        # Enforce human actor and timestamp in state machine
+        task.transition(
+            TaskStatus.APPROVED, actor=event.sender_name, timestamp=event.timestamp
+        )
         confirm_card = WorkflowFormatter.format_approval_confirmation(
-            task.task_id, event.sender_name
+            task.task_id, event.sender_name, timestamp=task.approved_at
         )
         self.client.send_message(
             event.room_id, confirm_card, metadata={"task_id": task.task_id}
@@ -94,12 +106,24 @@ class RepoRescueDispatcher:
 
     def _handle_rejection(self, event: SwitchMessageEvent) -> BugTask | None:
         """Handles human /reject command in the Switch room."""
+        if not event.is_human_sender:
+            warn_msg = (
+                f"⚠️ Rejection ignored: Rejections must be submitted by a verified human teammate "
+                f"(received from '@{event.sender_name}')."
+            )
+            self.client.send_message(event.room_id, warn_msg)
+            return None
+
         task_id = self._resolve_target_task_id(event)
         if not task_id or task_id not in self.tasks:
             return None
 
         task = self.tasks[task_id]
         if task.status != TaskStatus.AWAITING_APPROVAL:
+            self.client.send_message(
+                event.room_id,
+                f"⚠️ Rejection rejected: Task `{task.task_id}` is in state `{task.status}`, not `awaiting_approval`.",
+            )
             return task
 
         task.transition(TaskStatus.REJECTED, actor=event.sender_name)

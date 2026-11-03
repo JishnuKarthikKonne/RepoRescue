@@ -29,8 +29,11 @@ class BugTask:
     evidence: list[str] = field(default_factory=list)
     proposed_branch: str | None = None
     approval_by: str | None = None
+    approved_at: datetime | None = None
 
-    def transition(self, new_status: TaskStatus, *, actor: str) -> None:
+    def transition(
+        self, new_status: TaskStatus, *, actor: str, timestamp: datetime | None = None
+    ) -> None:
         allowed = {
             TaskStatus.REPORTED: {TaskStatus.TRIAGED, TaskStatus.FAILED},
             TaskStatus.TRIAGED: {TaskStatus.REPRODUCING, TaskStatus.FAILED},
@@ -49,3 +52,4 @@ class BugTask:
             if not actor.strip():
                 raise ValueError("Approval actor must be named")
             self.approval_by = actor
+            self.approved_at = timestamp or datetime.now(UTC)

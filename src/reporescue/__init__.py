@@ -18,6 +18,7 @@ from .switch import (
     SwitchClientProtocol,
     SwitchConfig,
     SwitchError,
+    SwitchListener,
     SwitchMessageEvent,
     WorkflowFormatter,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "SwitchClientProtocol",
     "SwitchConfig",
     "SwitchError",
+    "SwitchListener",
     "SwitchMessageEvent",
     "TaskStatus",
     "UncommittedChangesError",

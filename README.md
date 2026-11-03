@@ -21,6 +21,28 @@ pytest
 ruff check .
 ```
 
+## Running the Application
+
+### 1. Live Switch Room Listener
+Starts listening for inbound bug reports in the configured Switch/Mattermost room:
+```powershell
+python -m reporescue.cli --listen
+# Or specify room override:
+python -m reporescue.cli --listen --room-id "!reporescue:localhost"
+```
+
+### 2. Offline Mock Mode (No Switch Server Required)
+For offline local development and demonstration:
+```powershell
+python -m reporescue.cli --mock
+```
+
+### 3. Interactive Demo Simulation
+Runs the mock listener and automatically injects a sample bug report:
+```powershell
+python -m reporescue.cli --mock --demo
+```
+
 ## Switch Room Setup & Configuration
 
 1. Copy `.env.example` to `.env`:
@@ -35,29 +57,32 @@ ruff check .
 
 ## Core Modules
 
-### 1. Switch Room & Event Bridge (`reporescue.switch`)
-Connects to the Switch Agent Bridge (Switch Core 0.31.0+), parses room events, and publishes workflow updates:
+### 1. Switch Room Listener & Bridge (`reporescue.switch`)
+Connects to the Switch Agent Bridge (Switch Core 0.31.0+), deduplicates events, and publishes workflow updates:
 ```python
-from reporescue.switch import SwitchClient, RepoRescueDispatcher, SwitchConfig
+from reporescue.switch import (
+    SwitchClient,
+    RepoRescueDispatcher,
+    SwitchListener,
+    SwitchConfig,
+)
 
-# Load credentials from .env or pass explicitly
+# Initialize client and listener
 client = SwitchClient(SwitchConfig.from_env())
 dispatcher = RepoRescueDispatcher(client)
+listener = SwitchListener(client, dispatcher, room_id="!reporescue:localhost")
 
-# Ingest an incoming bug report event from the Switch room
-task = dispatcher.handle_message_event(event)
-
-# Publish progress updates as agents complete stages
-dispatcher.publish_triage(task.task_id, room_id, severity="P1", acceptance_criteria="...")
-dispatcher.publish_reproduction(task.task_id, room_id, test_file="tests/test_bug.py", exit_code=1, output_snippet="...")
-dispatcher.publish_fix_proposed(task.task_id, room_id, branch_name="reporescue/issue-1", diff_snippet="...", rationale="...")
-dispatcher.publish_verification(task.task_id, room_id, passed_count=5, failed_count=0, duration_s=0.8, evidence_text="...")
-
-# Human in the Switch room responds with `/approve`
-# Dispatcher verifies the human approval gate before advancing to APPROVED
+# Run listener loop (handles exponential backoff and graceful shutdown)
+listener.run_loop()
 ```
 
-### 2. Git Worktree Isolation (`reporescue.git_ops`)
+### 2. Human Approval Hardening
+Human approval is a hard security gate. RepoRescue enforces:
+- **Verified Human Identity**: Automated agents, bots, or unverified automated messages cannot grant approval. Senders with `sender_kind == "agent"`, `sender_kind == "bot"`, or bot-like identifiers are rejected.
+- **Timestamp & Attribution**: When a verified human sends `/approve`, the approver's name and ISO timestamp are immutably recorded in `task.approval_by` and `task.approved_at`.
+- **State Invariant**: Approvals submitted when a task is not in `awaiting_approval` (e.g. before verification passes) are rejected.
+
+### 3. Git Worktree Isolation (`reporescue.git_ops`)
 Safely creates, inspects, and cleans up isolated worktrees without ever touching the main working tree:
 ```python
 from reporescue.git_ops import WorktreeManager
@@ -76,7 +101,7 @@ else:
     mgr.remove_worktree(wt.path, force=True)
 ```
 
-### 3. Isolated Test Execution Runner (`reporescue.runner`)
+### 4. Isolated Test Execution Runner (`reporescue.runner`)
 Executes subprocess commands without `shell=True`, capturing duration, stdout, stderr, timeout, and truncation:
 ```python
 from reporescue.runner import run_command, run_pytest
@@ -90,14 +115,18 @@ print(f"Execution Output:\n{result.stdout}")
 ## Testing in a Switch Room
 
 1. Ensure the Switch Console is active (`http://localhost:65008`).
-2. In the connected Mattermost/Switch channel (e.g. `#reporescue`), post a bug report:
+2. Start the listener:
+   ```powershell
+   python -m reporescue.cli --listen
+   ```
+3. In the connected Mattermost/Switch channel (e.g. `#reporescue`), post a bug report:
    ```text
-   Bug: Checkout returns HTTP 500 when coupon code is expired
+   Bug: Checkout returns HTTP 500 when coupon is expired
    Steps to reproduce: POST /checkout with code='EXPIRED'
    ```
-3. RepoRescue receives the event, posts an acknowledgment with the Task ID, and runs through triage, reproduction, patch generation, and verification.
-4. When the verification card appears, review the diff and reply in the room:
+4. Observe RepoRescue post automated progress cards (Triage, Reproduction, Fix Proposal, Verification).
+5. When the verification card requests approval, reply in the room:
    ```text
    /approve
    ```
-5. RepoRescue verifies the human approval gate and transitions the task to `approved`.
+6. RepoRescue verifies the human approval gate and transitions the task to `approved`.

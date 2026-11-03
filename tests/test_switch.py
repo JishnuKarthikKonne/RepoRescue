@@ -287,3 +287,199 @@ def test_dispatcher_rejection_flow():
     assert rejected_task is not None
     assert rejected_task.status == TaskStatus.REJECTED
     assert "Task Rejected" in mock_client.last_message_content
+
+
+def test_approval_rejected_from_agent_or_bot():
+    mock_client = MockSwitchClient()
+    dispatcher = RepoRescueDispatcher(mock_client)
+
+    # Ingest task and transition to awaiting approval
+    task = dispatcher.handle_message_event(
+        SwitchMessageEvent.from_agent_event(
+            {
+                "type": "message",
+                "room_id": "!room",
+                "payload": {
+                    "body": "Bug: memory leak",
+                    "sender": "@dev",
+                    "sender_name": "Dev",
+                    "sender_kind": "user",
+                },
+            }
+        )
+    )
+    assert task is not None
+    for st in [
+        TaskStatus.TRIAGED,
+        TaskStatus.REPRODUCING,
+        TaskStatus.REPRODUCED,
+        TaskStatus.FIX_PROPOSED,
+        TaskStatus.VERIFYING,
+        TaskStatus.VERIFIED,
+        TaskStatus.AWAITING_APPROVAL,
+    ]:
+        task.transition(st, actor="system")
+
+    # Bot attempts to approve: sender_kind="agent"
+    bot_event = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room",
+            "payload": {
+                "body": "/approve",
+                "sender": "agent:auto-fixer",
+                "sender_name": "AutoFixerAgent",
+                "sender_kind": "agent",
+            },
+        }
+    )
+    assert bot_event is not None
+    result = dispatcher.handle_message_event(bot_event)
+    assert result is None
+    # Task must NOT have transitioned to APPROVED
+    assert task.status == TaskStatus.AWAITING_APPROVAL
+    assert task.approval_by is None
+    assert "Approval rejected" in mock_client.last_message_content
+    assert "automated agent or bot" in mock_client.last_message_content
+
+
+def test_approval_rejected_from_bot_display_name():
+    mock_client = MockSwitchClient()
+    dispatcher = RepoRescueDispatcher(mock_client)
+
+    task = dispatcher.handle_message_event(
+        SwitchMessageEvent.from_agent_event(
+            {
+                "type": "message",
+                "room_id": "!room",
+                "payload": {
+                    "body": "Bug: crash",
+                    "sender": "@dev",
+                    "sender_name": "Dev",
+                    "sender_kind": "user",
+                },
+            }
+        )
+    )
+    assert task is not None
+    for st in [
+        TaskStatus.TRIAGED,
+        TaskStatus.REPRODUCING,
+        TaskStatus.REPRODUCED,
+        TaskStatus.FIX_PROPOSED,
+        TaskStatus.VERIFYING,
+        TaskStatus.VERIFIED,
+        TaskStatus.AWAITING_APPROVAL,
+    ]:
+        task.transition(st, actor="system")
+
+    # Name ending in 'bot' or matching 'reporescue'
+    bot_name_event = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room",
+            "payload": {
+                "body": "/approve",
+                "sender": "@ci_bot:localhost",
+                "sender_name": "AutoMergeBot",
+            },
+        }
+    )
+    assert bot_name_event is not None
+    result = dispatcher.handle_message_event(bot_name_event)
+    assert result is None
+    assert task.status == TaskStatus.AWAITING_APPROVAL
+
+
+def test_approval_accepted_from_verified_human_records_timestamp():
+    mock_client = MockSwitchClient()
+    dispatcher = RepoRescueDispatcher(mock_client)
+
+    task = dispatcher.handle_message_event(
+        SwitchMessageEvent.from_agent_event(
+            {
+                "type": "message",
+                "room_id": "!room",
+                "payload": {
+                    "body": "Bug: crash",
+                    "sender": "@dev",
+                    "sender_name": "Dev",
+                    "sender_kind": "user",
+                },
+            }
+        )
+    )
+    assert task is not None
+    for st in [
+        TaskStatus.TRIAGED,
+        TaskStatus.REPRODUCING,
+        TaskStatus.REPRODUCED,
+        TaskStatus.FIX_PROPOSED,
+        TaskStatus.VERIFYING,
+        TaskStatus.VERIFIED,
+        TaskStatus.AWAITING_APPROVAL,
+    ]:
+        task.transition(st, actor="system")
+
+    human_event = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room",
+            "payload": {
+                "body": "/approve",
+                "sender": "@jishnu:localhost",
+                "sender_name": "Jishnu",
+                "sender_kind": "user",
+                "timestamp": 1730616000000,
+            },
+        }
+    )
+    assert human_event is not None
+    result = dispatcher.handle_message_event(human_event)
+    assert result is not None
+    assert result.status == TaskStatus.APPROVED
+    assert result.approval_by == "Jishnu"
+    assert result.approved_at is not None
+    assert result.approved_at == human_event.timestamp
+
+
+def test_approval_rejected_when_not_in_awaiting_approval_state():
+    mock_client = MockSwitchClient()
+    dispatcher = RepoRescueDispatcher(mock_client)
+
+    task = dispatcher.handle_message_event(
+        SwitchMessageEvent.from_agent_event(
+            {
+                "type": "message",
+                "room_id": "!room",
+                "payload": {
+                    "body": "Bug: premature approval test",
+                    "sender": "@dev",
+                    "sender_name": "Dev",
+                    "sender_kind": "user",
+                },
+            }
+        )
+    )
+    assert task is not None
+    assert task.status == TaskStatus.REPORTED
+
+    # Attempting to approve while still in REPORTED state
+    premature_event = SwitchMessageEvent.from_agent_event(
+        {
+            "type": "message",
+            "room_id": "!room",
+            "payload": {
+                "body": "/approve",
+                "sender": "@lead:localhost",
+                "sender_name": "Lead Dev",
+                "sender_kind": "user",
+            },
+        }
+    )
+    assert premature_event is not None
+    result = dispatcher.handle_message_event(premature_event)
+    assert result is not None
+    assert result.status == TaskStatus.REPORTED  # Did not change
+    assert "Approval rejected" in mock_client.last_message_content
+    assert "Mandatory verification tests must pass" in mock_client.last_message_content
