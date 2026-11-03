@@ -17,19 +17,17 @@ def parse_repo_from_remote_url(url: str) -> str | None:
     """
     if not url or not isinstance(url, str):
         return None
-    url = url.strip()
+    clean = url.strip().rstrip("/")
+    if clean.endswith(".git"):
+        clean = clean[:-4]
 
-    # SSH format: git@github.com:owner/repo.git or ssh://git@github.com/owner/repo.git
-    ssh_match = re.match(
-        r"^(?:ssh://)?git@[\w.-]+[:/]([^/]+)/([^/.]+?)(?:\.git)?/?$", url
-    )
+    # SSH format: git@github.com:owner/repo or ssh://git@github.com/owner/repo
+    ssh_match = re.match(r"^(?:ssh://)?git@[\w.-]+[:/]([^/]+)/([^/]+)$", clean)
     if ssh_match:
         return f"{ssh_match.group(1)}/{ssh_match.group(2)}"
 
-    # HTTPS format: https://[user:token@]github.com/owner/repo[.git]
-    https_match = re.match(
-        r"^https?://(?:[^@]+@)?[\w.-]+/([^/]+)/([^/.]+)(?:\.git)?/?$", url
-    )
+    # HTTPS format: https://[user:token@]github.com/owner/repo
+    https_match = re.match(r"^https?://(?:[^@]+@)?[\w.-]+/([^/]+)/([^/]+)$", clean)
     if https_match:
         return f"{https_match.group(1)}/{https_match.group(2)}"
 
